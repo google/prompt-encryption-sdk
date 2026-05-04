@@ -20,11 +20,13 @@ import json
 import logging
 import ssl
 import types
-from typing import Any
+from typing import Any, Optional
 
 from prompt_encryption_sdk.client import constants
 from prompt_encryption_sdk.client import exceptions
 from prompt_encryption_sdk.proto import attestation_pb2
+from prompt_encryption_sdk.security import logging as security_logging
+from prompt_encryption_sdk.security import replay_protection
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -132,11 +134,15 @@ class AttestationValidator:
       policy: attestation_pb2.AttestationPolicy,
       oidc_validator: OIDCTokenValidator | None = None,
       pem_loader: Any = serialization.load_pem_public_key,
+      replay_validator: Optional[replay_protection.ReplayProtectionValidator] = None,
+      security_logger: Optional[security_logging.SecurityLogger] = None,
   ):
     self._policy = policy
     self._oidc_validator = oidc_validator or OIDCTokenValidator()
     self._owns_oidc_validator = oidc_validator is None
     self._pem_loader = pem_loader
+    self._replay_validator = replay_validator
+    self._security_logger = security_logger
 
   def close(self) -> None:
     """Closes resources held by the validator."""
@@ -161,6 +167,11 @@ class AttestationValidator:
         PolicyViolationError: If policy check fails.
     """
     if not response.evidence:
+      if self._security_logger:
+        self._security_logger.log_attestation_result(
+            valid=False,
+            reason="no_evidence_provided",
+        )
       raise exceptions.AttestationVerificationError(
           "No attestation evidence provided."
       )
@@ -177,11 +188,21 @@ class AttestationValidator:
     )
 
     if not gca_bundle:
+      if self._security_logger:
+        self._security_logger.log_attestation_result(
+            valid=False,
+            reason="gca_bundle_missing",
+        )
       raise exceptions.AttestationVerificationError(
           "required GCA evidence missing."
       )
 
     if not gca_bundle.attestation_token:
+      if self._security_logger:
+        self._security_logger.log_attestation_result(
+            valid=False,
+            reason="attestation_token_empty",
+        )
       raise exceptions.AttestationVerificationError(
           "GCA attestation token is empty."
       )
@@ -196,6 +217,11 @@ class AttestationValidator:
     # Checks that the Instance Public Key hash is inside the Token's 'eat_nonce'
     instance_pub_bytes = response.instance_public_key.key_bytes
     if not instance_pub_bytes:
+      if self._security_logger:
+        self._security_logger.log_attestation_result(
+            valid=False,
+            reason="instance_public_key_missing",
+        )
       raise exceptions.AttestationVerificationError(
           "Instance public key is missing."
       )
@@ -206,6 +232,11 @@ class AttestationValidator:
 
     # 5. Verify TLS Session Binding (Signature over EKM)
     if not response.session_signature:
+      if self._security_logger:
+        self._security_logger.log_attestation_result(
+            valid=False,
+            reason="session_signature_missing",
+        )
       raise exceptions.AttestationVerificationError(
           "session signature is missing."
       )
@@ -222,6 +253,11 @@ class AttestationValidator:
         signature=response.session_signature,
         payload=payload,
     )
+
+    if self._security_logger:
+      self._security_logger.log_attestation_result(
+          valid=True,
+      )
 
   def _enforce_policy(self, claims: Mapping[str, Any]) -> None:
     """Validates OIDC claims against the configured AttestationPolicy.
@@ -248,6 +284,9 @@ class AttestationValidator:
     except exceptions.AttestationVerificationError as e:
       raise exceptions.PolicyViolationError(f"Malformed token structure: {e}") from e
 
+    if self._security_logger:
+      self._security_logger.log_attestation_result(valid=True)
+
     # 1. Hardware Model Validation
     # GCA Profile: 'hwmodel' claim contains the TEE type
     if self._policy.hw_model != attestation_pb2.HARDWARE_MODEL_UNSPECIFIED:
@@ -264,6 +303,12 @@ class AttestationValidator:
         )
 
       if token_hw != expected_hw_string:
+        if self._security_logger:
+          self._security_logger.log_policy_violation(
+              policy_type="hardware_model",
+              expected=expected_hw_string,
+              actual=str(token_hw),
+          )
         raise exceptions.PolicyViolationError(
             f"Hardware model mismatch. Expected {expected_hw_string!r}, got"
             f" {token_hw!r}"
@@ -276,6 +321,12 @@ class AttestationValidator:
       if workload_policy.image_hash:
         token_digest = container_claims.get("image_digest")
         if token_digest != workload_policy.image_hash:
+          if self._security_logger:
+            self._security_logger.log_policy_violation(
+                policy_type="workload_image_hash",
+                expected=workload_policy.image_hash,
+                actual=str(token_digest),
+            )
           raise exceptions.PolicyViolationError(
               "Workload image hash mismatch. Expected"
               f" {workload_policy.image_hash}, got {token_digest}"
@@ -298,6 +349,12 @@ class AttestationValidator:
         )
 
         if not found_key:
+          if self._security_logger:
+            self._security_logger.log_policy_violation(
+                policy_type="workload_signing_key",
+                expected=workload_policy.signing_key_id,
+                actual="none",
+            )
           raise exceptions.PolicyViolationError(
               "Workload image not signed by trusted key:"
               f" {workload_policy.signing_key_id}"
@@ -315,10 +372,19 @@ class AttestationValidator:
           continue
         actual_value = gce_claims.get(field_name)
         if actual_value != expected_value:
+          if self._security_logger:
+            self._security_logger.log_policy_violation(
+                policy_type=f"gce_instance_{field_name}",
+                expected=str(expected_value),
+                actual=str(actual_value),
+            )
           raise exceptions.PolicyViolationError(
               f"GCE Instance {field_name} mismatch. "
               f"Expected {expected_value}, got {actual_value}"
           )
+
+    if self._security_logger:
+      self._security_logger.log_attestation_result(valid=True)
 
   def _verify_instance_key_binding(
       self, claims: Mapping[str, Any], pub_key_bytes: bytes,
@@ -366,6 +432,9 @@ class AttestationValidator:
             f" {eat_nonce_list!r}."
         )
 
+    if self._security_logger:
+      self._security_logger.log_attestation_result(valid=True)
+
   def _verify_session_signature(
       self,
       pub_key_proto: attestation_pb2.EcdsaP256PublicKey,
@@ -393,6 +462,9 @@ class AttestationValidator:
         )
 
       public_key.verify(signature, payload, ec.ECDSA(hashes.SHA256()))
+
+      if self._security_logger:
+        self._security_logger.log_attestation_result(valid=True)
     except Exception as e:
       if isinstance(e, exceptions.AttestationVerificationError):
         raise

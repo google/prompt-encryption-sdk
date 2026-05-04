@@ -29,6 +29,10 @@ import time
 
 from prompt_encryption_sdk.ekm import exporter as ekm_exporter
 from prompt_encryption_sdk.proto import attestation_pb2
+from prompt_encryption_sdk.security import config as security_config
+from prompt_encryption_sdk.security import logging as security_logging
+from prompt_encryption_sdk.security import pinning
+from prompt_encryption_sdk.security import replay_protection
 from google.protobuf import json_format
 from urllib3 import connection
 from urllib3 import connectionpool
@@ -53,6 +57,7 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
       *args,
       ekm_exporter_fn=ekm_exporter.export_keying_material,
       attestation_validator_cls=validator.AttestationValidator,
+      security_config_obj=None,
       **kwargs,
   ):
     self._policy = kwargs.pop("policy", None)
@@ -68,6 +73,31 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
       self._revalidation_timeout = revalidation_timeout
     self._ekm_exporter_fn = ekm_exporter_fn
     self._attestation_validator_cls = attestation_validator_cls
+    
+    # Security configuration (optional)
+    self._security_config = security_config_obj or security_config.SecurityConfig()
+    self._security_logger = (
+        security_logging.SecurityLogger(level=self._security_config.security_log_level)
+        if self._security_config.enable_security_logging
+        else None
+    )
+    
+    # Certificate pinning (optional)
+    self._certificate_pinner = None
+    if self._security_config.enable_certificate_pinning:
+      self._certificate_pinner = pinning.CertificatePinner(
+          pinned_fingerprints=self._security_config.pinned_cert_fingerprints,
+          security_logger=self._security_logger,
+      )
+    
+    # Replay protection (optional)
+    self._replay_validator = None
+    if self._security_config.enable_replay_protection:
+      self._replay_validator = replay_protection.ReplayProtectionValidator(
+          nonce_ttl_seconds=self._security_config.replay_protection_nonce_ttl_seconds,
+          timestamp_skew_seconds=self._security_config.replay_protection_timestamp_skew_seconds,
+          security_logger=self._security_logger,
+      )
 
     self.is_attested = False
     self._last_attestation_time = 0.0
@@ -162,7 +192,11 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
       )
 
       # E. Validate
-      att_validator = self._attestation_validator_cls(self._policy)
+      att_validator = self._attestation_validator_cls(
+          self._policy,
+          replay_validator=self._replay_validator,
+          security_logger=self._security_logger,
+      )
       att_validator.validate(attest_resp, tls_ekm, expected_nonce=nonce)
 
       # Update timestamp on success
@@ -178,7 +212,15 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
     # 1. Standard TLS Connection (Creates self.sock)
     super().connect()
 
-    # 2. Post-Handshake Attestation
+    # 2. Certificate Pinning Validation (Optional)
+    if self._certificate_pinner:
+      cert_der = self._certificate_pinner.get_certificate_der_from_socket(
+          self.sock
+      )
+      if cert_der:
+        self._certificate_pinner.validate_certificate(cert_der, self.host)
+
+    # 3. Post-Handshake Attestation
     try:
       self._perform_attestation_handshake()
     except Exception:
@@ -268,6 +310,7 @@ class AttestedHTTPSConnectionPool(connectionpool.HTTPSConnectionPool):
       revalidation_timeout=datetime.timedelta(seconds=3300),
       ekm_exporter_fn=ekm_exporter.export_keying_material,
       attestation_validator_cls=validator.AttestationValidator,
+      security_config_obj=None,
       **kwargs,
   ):
     kwargs.update({
@@ -275,6 +318,7 @@ class AttestedHTTPSConnectionPool(connectionpool.HTTPSConnectionPool):
         "revalidation_timeout": revalidation_timeout,
         "ekm_exporter_fn": ekm_exporter_fn,
         "attestation_validator_cls": attestation_validator_cls,
+        "security_config_obj": security_config_obj,
     })
     self._policy = policy
     self._revalidation_timeout = revalidation_timeout
@@ -298,12 +342,14 @@ class AttestedPoolManager(poolmanager.PoolManager):
       revalidation_timeout=datetime.timedelta(seconds=3300),
       ekm_exporter_fn=ekm_exporter.export_keying_material,
       attestation_validator_cls=validator.AttestationValidator,
+      security_config_obj=None,
       **kwargs,
   ):
     self._policy = policy
     self._revalidation_timeout = revalidation_timeout
     self._ekm_exporter_fn = ekm_exporter_fn
     self._attestation_validator_cls = attestation_validator_cls
+    self._security_config = security_config_obj or security_config.SecurityConfig()
     super().__init__(**kwargs)
 
   def __repr__(self) -> str:
@@ -324,6 +370,7 @@ class AttestedPoolManager(poolmanager.PoolManager):
           ekm_exporter_fn=self._ekm_exporter_fn,
           attestation_validator_cls=self._attestation_validator_cls,
           revalidation_timeout=self._revalidation_timeout,
+          security_config_obj=self._security_config,
           **self.connection_pool_kw,
       )
     return super()._new_pool(scheme, host, port, request_context)
