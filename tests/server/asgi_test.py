@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Prompt Encryption SDK Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,10 +15,13 @@
 """Tests for server.asgi."""
 
 import asyncio
+from collections.abc import Sequence
+import http
 import json
 from unittest import mock
 
 from absl.testing import absltest
+from absl.testing import parameterized
 from prompt_encryption_sdk.proto import attestation_pb2
 from prompt_encryption_sdk.server import asgi
 from prompt_encryption_sdk.server import attestation
@@ -26,10 +29,9 @@ from prompt_encryption_sdk.server import keys
 from prompt_encryption_sdk.server import token
 from google.protobuf import json_format
 import uvicorn
-from uvicorn.protocols.http import h11_impl
 
 
-class MiddlewareTest(absltest.TestCase):
+class MiddlewareTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -41,12 +43,91 @@ class MiddlewareTest(absltest.TestCase):
     self.send = mock.AsyncMock()
     self.ssl_obj = mock.MagicMock()
 
-  def test_call_other_path(self):
+  def _assert_error_response(
+      self, expected_status: int, expected_error_substrings: Sequence[str]
+  ):
+    self.send.assert_has_calls([
+        mock.call({
+            "type": "http.response.start",
+            "status": expected_status,
+            "headers": mock.ANY,
+        }),
+        mock.call({"type": "http.response.body", "body": mock.ANY}),
+    ])
+    _, response_body_call = self.send.call_args_list
+    (response_body_arg,) = response_body_call.args
+    body_dict = json.loads(response_body_arg["body"])
+    for substring in expected_error_substrings:
+      self.assertIn(substring, body_dict["error"])
+
+  def test_call_other_path_attested(self):
     async def run():
-      scope = {"type": "http", "path": "/other"}
+      self.mw._attested_sockets.add(self.ssl_obj)
+      scope = {
+          "type": "http",
+          "path": "/other",
+          "extensions": {"tls_socket": self.ssl_obj},
+      }
       receive = mock.AsyncMock()
       await self.mw(scope, receive, self.send)
+
       self.app.assert_called_once_with(scope, receive, self.send)
+
+    asyncio.run(run())
+
+  def test_call_other_path_unattested(self):
+    async def run():
+      scope = {
+          "type": "http",
+          "path": "/other",
+          "extensions": {"tls_socket": self.ssl_obj},
+      }
+      receive = mock.AsyncMock()
+      await self.mw(scope, receive, self.send)
+
+      self.app.assert_not_called()
+      expected_body = (
+          b'{"error":"Unauthorized: Connection must be attested first."}'
+      )
+      self.send.assert_has_calls([
+          mock.call({
+              "type": "http.response.start",
+              "status": 401,
+              "headers": [
+                  (b"content-length", b"60"),
+                  (b"content-type", b"application/json"),
+              ],
+          }),
+          mock.call({"type": "http.response.body", "body": expected_body}),
+      ])
+
+    asyncio.run(run())
+
+  def test_call_other_path_missing_socket(self):
+    async def run():
+      scope = {
+          "type": "http",
+          "path": "/other",
+          "extensions": {},
+      }
+      receive = mock.AsyncMock()
+      await self.mw(scope, receive, self.send)
+
+      self.app.assert_not_called()
+      expected_body = (
+          b'{"error":"Unauthorized: Connection must be attested first."}'
+      )
+      self.send.assert_has_calls([
+          mock.call({
+              "type": "http.response.start",
+              "status": 401,
+              "headers": [
+                  (b"content-length", b"60"),
+                  (b"content-type", b"application/json"),
+              ],
+          }),
+          mock.call({"type": "http.response.body", "body": expected_body}),
+      ])
 
     asyncio.run(run())
 
@@ -82,15 +163,18 @@ class MiddlewareTest(absltest.TestCase):
           request_proto,
           ssl_obj=self.ssl_obj,
       )
-      calls = self.send.call_args_list
-      self.assertEqual(calls[0].args[0]["type"], "http.response.start")
-      self.assertEqual(calls[0].args[0]["status"], 200)
-      self.assertEqual(calls[1].args[0]["type"], "http.response.body")
+      response_start_call, response_body_call = self.send.call_args_list
+      (response_start_arg,) = response_start_call.args
+      (response_body_arg,) = response_body_call.args
+      self.assertEqual(response_start_arg["type"], "http.response.start")
+      self.assertEqual(response_start_arg["status"], http.HTTPStatus.OK)
+      self.assertEqual(response_body_arg["type"], "http.response.body")
       response_dict = json_format.MessageToDict(response_proto)
       self.assertEqual(
-          json.loads(calls[1].args[0]["body"]),
+          json.loads(response_body_arg["body"]),
           response_dict,
       )
+      self.assertIn(self.ssl_obj, self.mw._attested_sockets)
 
     asyncio.run(run())
 
@@ -128,17 +212,21 @@ class MiddlewareTest(absltest.TestCase):
       await self.mw(scope, receive, self.send)
 
       self.mock_attested_tls.attest_connection.assert_called_once_with(
-          request_proto, ssl_obj=self.ssl_obj,
+          request_proto,
+          ssl_obj=self.ssl_obj,
       )
-      calls = self.send.call_args_list
-      self.assertEqual(calls[0].args[0]["type"], "http.response.start")
-      self.assertEqual(calls[0].args[0]["status"], 200)
-      self.assertEqual(calls[1].args[0]["type"], "http.response.body")
+      response_start_call, response_body_call = self.send.call_args_list
+      (response_start_arg,) = response_start_call.args
+      (response_body_arg,) = response_body_call.args
+      self.assertEqual(response_start_arg["type"], "http.response.start")
+      self.assertEqual(response_start_arg["status"], http.HTTPStatus.OK)
+      self.assertEqual(response_body_arg["type"], "http.response.body")
       response_dict = json_format.MessageToDict(response_proto)
       self.assertEqual(
-          json.loads(calls[1].args[0]["body"]),
+          json.loads(response_body_arg["body"]),
           response_dict,
       )
+      self.assertIn(self.ssl_obj, self.mw._attested_sockets)
 
     asyncio.run(run())
 
@@ -160,24 +248,51 @@ class MiddlewareTest(absltest.TestCase):
       await self.mw(scope, receive, self.send)
 
       self.mock_attested_tls.attest_connection.assert_not_called()
-      calls = self.send.call_args_list
-      self.assertEqual(calls[0].args[0]["type"], "http.response.start")
-      self.assertEqual(calls[0].args[0]["status"], 500)
-      self.assertEqual(calls[1].args[0]["type"], "http.response.body")
-      body_dict = json.loads(calls[1].args[0]["body"])
-      self.assertEqual(
-          body_dict,
-          {
-              "error": (
-                  "An internal server error occurred: RuntimeError('TLS Socket"
-                  " not found.')"
-              )
-          },
+      self._assert_error_response(
+          http.HTTPStatus.INTERNAL_SERVER_ERROR,
+          [
+              "An internal server error occurred: RuntimeError('TLS Socket"
+              " not found.')"
+          ],
       )
 
     asyncio.run(run())
 
-  def test_handle_attestation_invalid_json_body(self):
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="invalid_json_body",
+          body=b"invalid json",
+          expected_status=http.HTTPStatus.BAD_REQUEST,
+          expected_error_substrings=["An internal server error occurred"],
+      ),
+      dict(
+          testcase_name="malformed_json_list",
+          body=b"[]",
+          expected_status=http.HTTPStatus.BAD_REQUEST,
+          expected_error_substrings=[
+              "An internal server error occurred",
+              "Malformed JSON structure",
+          ],
+      ),
+      dict(
+          testcase_name="undecodable_body",
+          body=b"\x80abc",
+          expected_status=http.HTTPStatus.INTERNAL_SERVER_ERROR,
+          expected_error_substrings=["An internal server error occurred"],
+      ),
+      dict(
+          testcase_name="proto_parse_error",
+          body=b'{"requiredVerifierType": 1}',
+          expected_status=http.HTTPStatus.BAD_REQUEST,
+          expected_error_substrings=["An internal server error occurred"],
+      ),
+  )
+  def test_handle_attestation_bad_requests(
+      self,
+      body: bytes,
+      expected_status: int,
+      expected_error_substrings: Sequence[str],
+  ):
     async def run():
       scope = {
           "type": "http",
@@ -186,7 +301,6 @@ class MiddlewareTest(absltest.TestCase):
           "headers": [],
           "extensions": {"tls_socket": self.ssl_obj},
       }
-      body = b"invalid json"
 
       async def receive():
         return {"type": "http.request", "body": body, "more_body": False}
@@ -194,64 +308,7 @@ class MiddlewareTest(absltest.TestCase):
       await self.mw(scope, receive, self.send)
 
       self.mock_attested_tls.attest_connection.assert_not_called()
-      calls = self.send.call_args_list
-      self.assertEqual(calls[0].args[0]["type"], "http.response.start")
-      self.assertEqual(calls[0].args[0]["status"], 400)
-      self.assertEqual(calls[1].args[0]["type"], "http.response.body")
-      body_dict = json.loads(calls[1].args[0]["body"])
-      self.assertIn("An internal server error occurred", body_dict["error"])
-
-    asyncio.run(run())
-
-  def test_handle_attestation_undecodable_body(self):
-    async def run():
-      scope = {
-          "type": "http",
-          "path": "/_attest-connection",
-          "method": "POST",
-          "headers": [],
-          "extensions": {"tls_socket": self.ssl_obj},
-      }
-      body = b"\x80abc"
-
-      async def receive():
-        return {"type": "http.request", "body": body, "more_body": False}
-
-      await self.mw(scope, receive, self.send)
-
-      self.mock_attested_tls.attest_connection.assert_not_called()
-      calls = self.send.call_args_list
-      self.assertEqual(calls[0].args[0]["type"], "http.response.start")
-      self.assertEqual(calls[0].args[0]["status"], 500)
-      self.assertEqual(calls[1].args[0]["type"], "http.response.body")
-      body_dict = json.loads(calls[1].args[0]["body"])
-      self.assertIn("An internal server error occurred", body_dict["error"])
-
-    asyncio.run(run())
-
-  def test_handle_attestation_proto_parse_error(self):
-    async def run():
-      scope = {
-          "type": "http",
-          "path": "/_attest-connection",
-          "method": "POST",
-          "headers": [],
-          "extensions": {"tls_socket": self.ssl_obj},
-      }
-      body = b'{"requiredVerifierType": 1}'
-
-      async def receive():
-        return {"type": "http.request", "body": body, "more_body": False}
-
-      await self.mw(scope, receive, self.send)
-
-      self.mock_attested_tls.attest_connection.assert_not_called()
-      calls = self.send.call_args_list
-      self.assertEqual(calls[0].args[0]["type"], "http.response.start")
-      self.assertEqual(calls[0].args[0]["status"], 400)
-      self.assertEqual(calls[1].args[0]["type"], "http.response.body")
-      body_dict = json.loads(calls[1].args[0]["body"])
-      self.assertIn("An internal server error occurred", body_dict["error"])
+      self._assert_error_response(expected_status, expected_error_substrings)
 
     asyncio.run(run())
 
@@ -277,18 +334,9 @@ class MiddlewareTest(absltest.TestCase):
       await self.mw(scope, receive, self.send)
 
       self.mock_attested_tls.attest_connection.assert_called_once()
-      calls = self.send.call_args_list
-      self.assertEqual(calls[0].args[0]["type"], "http.response.start")
-      self.assertEqual(calls[0].args[0]["status"], 500)
-      self.assertEqual(calls[1].args[0]["type"], "http.response.body")
-      body_dict = json.loads(calls[1].args[0]["body"])
-      self.assertEqual(
-          body_dict,
-          {
-              "error": (
-                  "An internal server error occurred: ValueError('test error')"
-              )
-          },
+      self._assert_error_response(
+          http.HTTPStatus.INTERNAL_SERVER_ERROR,
+          ["An internal server error occurred: ValueError('test error')"],
       )
 
     asyncio.run(run())

@@ -88,8 +88,8 @@ gcloud storage buckets create "gs://${BUCKET_NAME}" --location="${REGION}" --pro
 
 echo "Provisioning model to GCS..."
 python3 -m venv venv-provision
-./venv-provision/bin/pip install -i https://pypi.org/simple/ huggingface_hub google-cloud-storage
-./venv-provision/bin/python3 codelabs/provision_model.py --bucket-name "${BUCKET_NAME}"
+./venv-provision/bin/pip install -i https://pypi.org/simple/ huggingface_hub google-cloud-storage absl-py
+./venv-provision/bin/python3 codelabs/provision_model.py --bucket_name "${BUCKET_NAME}"
 rm -rf venv-provision
 
 echo "Building and pushing Docker image..."
@@ -137,7 +137,7 @@ gcloud compute instances create "${VM_NAME}" \
     --machine-type=a3-highgpu-1g \
     --confidential-compute-type=TDX \
     --maintenance-policy=TERMINATE \
-    --image-family=confidential-space-debug-preview-cgpu \
+    --image-family=confidential-space-debug \
     --image-project=confidential-space-images \
     --service-account="${SA_EMAIL}" \
     --scopes=cloud-platform \

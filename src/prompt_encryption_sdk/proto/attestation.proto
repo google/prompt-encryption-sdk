@@ -43,6 +43,15 @@ message EcdsaP256PublicKey {
   bytes key_bytes = 1;
 }
 
+// SessionSignaturePayload binds the attestation to the TLS session.
+// It is signed by the server's private key.
+message SessionSignaturePayload {
+  // The raw 32-byte SHA-256 hash of the 32-byte Exported Keying Material (EKM) from the TLS session.
+  bytes ekm_hash = 1;
+  // The raw 32-byte SHA-256 hash of the attestation token.
+  bytes token_hash = 2;
+}
+
 // AttestConnectionResponse is sent by the server to the client. It is sent only
 // if the server can satisfy all of the client's required RoTs.
 message AttestConnectionResponse {

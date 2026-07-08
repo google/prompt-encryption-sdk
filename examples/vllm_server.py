@@ -18,15 +18,15 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 def download_model_from_gcs(bucket_name: str, model_dir: str) -> None:
   """Downloads model from GCS bucket."""
   print(f"Downloading model from bucket {bucket_name} to {model_dir}...")
-  with storage.Client() as storage_client:
-    bucket = storage_client.bucket(bucket_name)
+  storage_client = storage.Client()
+  bucket = storage_client.bucket(bucket_name)
 
-    blobs = bucket.list_blobs()
-    for blob in blobs:
-      local_path = pathlib.Path(model_dir) / blob.name
-      local_path.parent.mkdir(parents=True, exist_ok=True)
-      print(f"Downloading {blob.name}...")
-      blob.download_to_filename(str(local_path))
+  blobs = bucket.list_blobs()
+  for blob in blobs:
+    local_path = pathlib.Path(model_dir) / blob.name
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading {blob.name}...")
+    blob.download_to_filename(str(local_path))
   print("Download complete.")
 
 

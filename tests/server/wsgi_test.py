@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Prompt Encryption SDK Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,10 +14,13 @@
 
 """Tests for server.wsgi."""
 
+import http
 import json
+import ssl
 from unittest import mock
 
 from absl.testing import absltest
+from absl.testing import parameterized
 from prompt_encryption_sdk.proto import attestation_pb2
 from prompt_encryption_sdk.server import attestation
 from prompt_encryption_sdk.server import keys
@@ -30,7 +33,7 @@ import werkzeug.test
 
 
 class PromptEncryptionWSGIMiddlewareTest(
-    absltest.TestCase
+    parameterized.TestCase
 ):
 
   def setUp(self):
@@ -46,16 +49,52 @@ class PromptEncryptionWSGIMiddlewareTest(
     self.mw = wsgi.PromptEncryptionWSGIMiddleware(self.app, self.mock_attested_tls)
     self.client = werkzeug.test.Client(self.mw)
 
-  def test_call_other_path(self):
+  def test_call_other_path_attested(self):
     def simple_app(_, start_response):
       start_response("200 OK", [("Content-Type", "text/plain")])
       return [b"ok"]
 
     self.app.side_effect = simple_app
-    response = self.client.get("/other")
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    self.mw._attested_sockets.add(mock_socket)
+    environ_overrides = {"prompt_encryption.socket": mock_socket}
+
+    response = self.client.get("/other", environ_overrides=environ_overrides)
     self.assertEqual(response.status_code, 200)
     self.assertEqual(response.data, b"ok")
     self.app.assert_called_once()
+
+  def test_call_other_path_unattested(self):
+    def simple_app(_, start_response):
+      start_response("200 OK", [("Content-Type", "text/plain")])
+      return [b"ok"]
+
+    self.app.side_effect = simple_app
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    environ_overrides = {"prompt_encryption.socket": mock_socket}
+
+    response = self.client.get("/other", environ_overrides=environ_overrides)
+    self.assertEqual(response.status_code, 401)
+    self.assertEqual(
+        json.loads(response.data),
+        {"error": "Unauthorized: Connection must be attested first."},
+    )
+    self.app.assert_not_called()
+
+  def test_call_other_path_missing_socket(self):
+    def simple_app(_, start_response):
+      start_response("200 OK", [("Content-Type", "text/plain")])
+      return [b"ok"]
+
+    self.app.side_effect = simple_app
+
+    response = self.client.get("/other")
+    self.assertEqual(response.status_code, 401)
+    self.assertEqual(
+        json.loads(response.data),
+        {"error": "Unauthorized: Connection must be attested first."},
+    )
+    self.app.assert_not_called()
 
   def test_handle_attestation_success(self):
     request_proto = attestation_pb2.AttestConnectionRequest()
@@ -69,7 +108,11 @@ class PromptEncryptionWSGIMiddlewareTest(
     self.mock_attested_tls.attest_connection.return_value = response_proto
 
     # Mock the socket injection in environ
-    environ_overrides = {"prompt_encryption.socket": mock.Mock()}
+    environ_overrides = {
+        "prompt_encryption.socket": mock.create_autospec(
+            ssl.SSLSocket, instance=True
+        )
+    }
 
     response = self.client.post(
         "/_attest-connection",
@@ -81,56 +124,70 @@ class PromptEncryptionWSGIMiddlewareTest(
         request_proto,
         ssl_obj=environ_overrides["prompt_encryption.socket"],
     )
-    self.assertEqual(response.status_code, 200)
+    self.assertEqual(response.status_code, http.HTTPStatus.OK)
 
     response_proto_parsed = json_format.Parse(
         response.data, attestation_pb2.AttestConnectionResponse()
     )
     self.assertEqual(response_proto_parsed, response_proto)
-
-  def test_handle_attestation_missing_socket(self):
-    request_proto = attestation_pb2.AttestConnectionRequest()
-    request_json = json_format.MessageToJson(request_proto)
-
-    response = self.client.post(
-        "/_attest-connection", json=json.loads(request_json)
+    self.assertIn(
+        environ_overrides["prompt_encryption.socket"],
+        self.mw._attested_sockets,
     )
 
-    # Expect 500 because RuntimeError is raised
-    self.assertEqual(response.status_code, 500)
-    self.assertIn(b"TLS Socket not found", response.data)
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="missing_socket",
+          json_body={},
+          environ_overrides=None,
+          mock_error=None,
+          expected_status=http.HTTPStatus.INTERNAL_SERVER_ERROR,
+          expected_error_substring=b"TLS Socket not found",
+      ),
+      dict(
+          testcase_name="parse_error",
+          json_body={"requiredVerifierType": 1},
+          environ_overrides=None,
+          mock_error=None,
+          expected_status=http.HTTPStatus.BAD_REQUEST,
+          expected_error_substring=b"Invalid request",
+      ),
+      dict(
+          testcase_name="malformed_json_list",
+          json_body=[],
+          environ_overrides=None,
+          mock_error=None,
+          expected_status=http.HTTPStatus.BAD_REQUEST,
+          expected_error_substring=b"Invalid request",
+      ),
+      dict(
+          testcase_name="internal_error",
+          json_body={},
+          environ_overrides={"prompt_encryption.socket": "mock_socket"},
+          mock_error=ValueError("test error"),
+          expected_status=http.HTTPStatus.INTERNAL_SERVER_ERROR,
+          expected_error_substring=b"test error",
+      ),
+  )
+  def test_handle_attestation_errors(
+      self, json_body, environ_overrides, mock_error, expected_status, expected_error_substring
+  ):
+    if mock_error:
+      self.mock_attested_tls.attest_connection.side_effect = mock_error
 
-  def test_handle_attestation_parse_error(self):
+    kwargs = {"json": json_body}
+    if environ_overrides:
+      # If using a mock, instantiate it here instead of in the decorator
+      if environ_overrides.get("prompt_encryption.socket") == "mock_socket":
+        environ_overrides["prompt_encryption.socket"] = mock.create_autospec(
+            ssl.SSLSocket, instance=True
+        )
+      kwargs["environ_overrides"] = environ_overrides
 
-    # Mock json_format.Parse to simulate a protobuf parsing error, as it is difficult
-    # to trigger a pure ParseError with standard JSON inputs due to permissive parsing.
-    with mock.patch.object(
-        wsgi.json_format,
-        "Parse",
-        side_effect=wsgi.json_format.ParseError("test"),
-    ):
-      response = self.client.post("/_attest-connection", json={})
-      self.assertEqual(response.status_code, 400)
-      self.assertIn(b"Invalid request", response.data)
+    response = self.client.post("/_attest-connection", **kwargs)
 
-  def test_handle_attestation_internal_error(self):
-    request_proto = attestation_pb2.AttestConnectionRequest()
-    request_json = json_format.MessageToJson(request_proto)
-
-    environ_overrides = {"prompt_encryption.socket": mock.Mock()}
-
-    self.mock_attested_tls.attest_connection.side_effect = ValueError(
-        "test error"
-    )
-
-    response = self.client.post(
-        "/_attest-connection",
-        json=json.loads(request_json),
-        environ_overrides=environ_overrides,
-    )
-
-    self.assertEqual(response.status_code, 500)
-    self.assertIn(b"test error", response.data)
+    self.assertEqual(response.status_code, expected_status)
+    self.assertIn(expected_error_substring, response.data)
 
   def test_run_gunicorn_app(self):
     mock_app = mock.Mock()
@@ -278,7 +335,11 @@ class PromptEncryptionWSGIMiddlewareTest(
         "Request",
         side_effect=Exception("Boom"),
     ):
-      environ_overrides = {"prompt_encryption.socket": mock.Mock()}
+      environ_overrides = {
+          "prompt_encryption.socket": mock.create_autospec(
+              ssl.SSLSocket, instance=True
+          )
+      }
       self.mock_attested_tls.attest_connection.return_value = (
           attestation_pb2.AttestConnectionResponse()
       )
@@ -287,7 +348,7 @@ class PromptEncryptionWSGIMiddlewareTest(
           "/_attest-connection", environ_overrides=environ_overrides
       )
 
-      self.assertEqual(response.status_code, 200)
+      self.assertEqual(response.status_code, http.HTTPStatus.OK)
       # Verify attest_connection called with empty request (result of fallback)
       args, _ = self.mock_attested_tls.attest_connection.call_args
       self.assertEqual(args[0], attestation_pb2.AttestConnectionRequest())

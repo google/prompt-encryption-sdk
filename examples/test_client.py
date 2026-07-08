@@ -68,7 +68,6 @@ def main() -> None:
       "max_tokens": args.max_tokens,
   }
 
-
   logging.info("Connecting to %s...", target_url)
 
   max_retries = 15
@@ -81,6 +80,13 @@ def main() -> None:
         # VM uses a self-signed certificate.
         response = http.post(target_url, json=payload, verify=False)
         logging.info("Status: %s", response.status_code)
+        if response.status_code == 200:
+          print("\n" + "=" * 50)
+          print("AI RESPONSE:")
+          print(response.json()["choices"][0]["text"])
+          print("=" * 50 + "\n")
+        else:
+          logging.error("Error Response: %s", response.text)
         break
     except requests.RequestException as e:
       logging.info(

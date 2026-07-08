@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Prompt Encryption SDK Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 import json
 import logging
 from typing import Any, Iterable
+import weakref
 
 from prompt_encryption_sdk.proto import attestation_pb2
 from prompt_encryption_sdk.server import attestation
@@ -27,7 +28,6 @@ import gunicorn.app.base
 from gunicorn.http import wsgi as gunicorn_wsgi
 from gunicorn.workers import sync
 import werkzeug.wrappers
-
 
 # Patch gunicorn to inject the socket into the environ.
 # This allows the middleware to access the raw SSL socket for EKM extraction.
@@ -70,6 +70,7 @@ class PromptEncryptionWSGIMiddleware:
   def __init__(self, app, attested_tls: attestation.AttestedTLS):
     self.app = app
     self.attested_tls = attested_tls
+    self._attested_sockets = weakref.WeakSet()
 
   def __repr__(self):
     return f"<{self.__class__.__name__} app={self.app!r}>"
@@ -81,6 +82,21 @@ class PromptEncryptionWSGIMiddleware:
 
     if path == "/_attest-connection":
       return self.handle_attestation(environ, start_response)
+
+    ssl_obj = environ.get("prompt_encryption.socket")
+    # NOMUTANTS -- Equivalent mutation: None not in WeakSet evaluates to True.
+    if not ssl_obj or ssl_obj not in self._attested_sockets:
+      error_json = json.dumps(
+          {"error": "Unauthorized: Connection must be attested first."}
+      ).encode("utf-8")
+      start_response(
+          "401 Unauthorized",
+          [
+              ("Content-Type", "application/json"),
+              ("Content-Length", str(len(error_json))),
+          ],
+      )
+      return [error_json]
 
     return self.app(environ, start_response)
 
@@ -106,8 +122,19 @@ class PromptEncryptionWSGIMiddleware:
     """
     try:
       body = self._parse_request(environ)
-      req = json_format.Parse(
-          body,
+
+      try:
+        parsed_json = json.loads(body.decode("utf-8") if body else "{}")
+      except json.JSONDecodeError as e:
+        raise json_format.ParseError("Invalid JSON") from e
+
+      if not isinstance(parsed_json, dict):
+        raise json_format.ParseError(
+            "Malformed JSON structure: Expected a dictionary"
+        )
+
+      req = json_format.ParseDict(
+          parsed_json,
           attestation_pb2.AttestConnectionRequest(),
           ignore_unknown_fields=True,
       )
@@ -124,6 +151,7 @@ class PromptEncryptionWSGIMiddleware:
       attestation_response_proto = self.attested_tls.attest_connection(
           req, ssl_obj=ssl_obj
       )
+      self._attested_sockets.add(ssl_obj)
       attestation_response_dict = json_format.MessageToDict(
           attestation_response_proto
       )

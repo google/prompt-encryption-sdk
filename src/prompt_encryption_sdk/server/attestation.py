@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Prompt Encryption SDK Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 
 """Attested TLS logic for Prompt Encryption SDK."""
 
+import hashlib
 from typing import Any
 
 from absl import logging
@@ -100,19 +101,21 @@ class AttestedTLS:
         )
 
     public_key, attestation_token = self.token_manager.get_identity_snapshot()
-    token_hash = keys.calculate_fingerprint(attestation_token)
+    token_hash_bytes = hashlib.sha256(attestation_token).digest()
+    ekm_hash_bytes = hashlib.sha256(ekm_bytes).digest()
+    payload = attestation_pb2.SessionSignaturePayload(
+        ekm_hash=ekm_hash_bytes, token_hash=token_hash_bytes
+    )
     signature = self.token_manager.key_manager.sign_payload(
-        ekm_bytes + token_hash.encode("utf-8")
+        payload.SerializeToString()
     )
 
-    if (
-        attestation_pb2.VerifierType.VERIFIER_TYPE_GCA
-        not in request.required_verifier_type
-    ):
-      raise ValueError(
-          "Unsupported verifier types requested:"
-          f" {request.required_verifier_type}"
-      )
+    for verifier_type in request.required_verifier_type:
+      if verifier_type != attestation_pb2.VerifierType.VERIFIER_TYPE_GCA:
+        raise ValueError(
+            "Unsupported verifier types requested:"
+            f" {request.required_verifier_type}"
+        )
 
     response = attestation_pb2.AttestConnectionResponse(
         evidence=[

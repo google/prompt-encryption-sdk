@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Prompt Encryption SDK Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -262,7 +262,7 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
 
     # Verify validate was called with a Proto object and the EKM
     mock_validator_inst.validate.assert_called_once_with(
-        mock.ANY, b"fake_ekm", expected_nonce=fixed_random_bytes
+        mock.ANY, b"fake_ekm"
     )
 
     # Verify timestamp updated

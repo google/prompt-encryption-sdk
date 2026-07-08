@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Prompt Encryption SDK Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -210,7 +210,7 @@ class AttestationValidator:
     # 2. Verify OIDC Token Signature (GCA Validation)
     claims = self._oidc_validator.validate_token(gca_bundle.attestation_token)
 
-    # # 3. Policy Enforcement (Workload, Image, Project)
+    # 3. Policy Enforcement (Workload, Image, Project)
     self._enforce_policy(claims)
 
     # 4. Verify Instance Key Binding
@@ -241,12 +241,16 @@ class AttestationValidator:
           "session signature is missing."
       )
 
-    # Reconstruct Payload: EKM || SHA256(Token)
-    token_hash = hashlib.sha256(
+    # Reconstruct the payload to verify the cryptographic binding of the
+    # TLS session.
+    token_hash_bytes = hashlib.sha256(
         gca_bundle.attestation_token.encode("utf-8")
-    ).hexdigest()
-    token_hash_bytes = token_hash.encode("utf-8")
-    payload = tls_ekm + token_hash_bytes
+    ).digest()
+    ekm_hash_bytes = hashlib.sha256(tls_ekm).digest()
+    payload_msg = attestation_pb2.SessionSignaturePayload(
+        ekm_hash=ekm_hash_bytes, token_hash=token_hash_bytes
+    )
+    payload = payload_msg.SerializeToString()
 
     self._verify_session_signature(
         response.instance_public_key,

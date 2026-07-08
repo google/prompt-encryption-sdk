@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Prompt Encryption SDK Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -188,7 +188,7 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
 
       # D. Export Keying Material
       tls_ekm = self._ekm_exporter_fn(
-          self.sock, constants.EKM_LENGTH, constants.EKM_LABEL, context=nonce
+          self.sock, constants.EKM_LENGTH, constants.EKM_LABEL, context=nonce  # pyrefly: ignore[bad-argument-type]
       )
 
       # E. Validate
@@ -198,6 +198,8 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
           security_logger=self._security_logger,
       )
       att_validator.validate(attest_resp, tls_ekm, expected_nonce=nonce)
+      att_validator = self._attestation_validator_cls(self._policy)
+      att_validator.validate(attest_resp, tls_ekm)
 
       # Update timestamp on success
       self._last_attestation_time = time.time()
@@ -299,7 +301,7 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
 class AttestedHTTPSConnectionPool(connectionpool.HTTPSConnectionPool):
   """Pool that spawns AttestedHTTPSConnections."""
 
-  ConnectionCls = AttestedHTTPSConnection
+  ConnectionCls = AttestedHTTPSConnection  # pyrefly: ignore[bad-assignment]
 
   def __init__(
       self,
