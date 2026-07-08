@@ -15,9 +15,10 @@
 """Client for making attested prompt encryption requests."""
 
 import dataclasses
-from typing import Any
+from typing import Any, Optional
 
 from prompt_encryption_sdk.proto import attestation_pb2
+from prompt_encryption_sdk.security import config as security_config
 from google.protobuf import text_format
 import requests
 import requests.adapters
@@ -33,12 +34,14 @@ class AttestedHTTPSAdapter(requests.adapters.HTTPAdapter):
       self, *,
       policy: attestation_pb2.AttestationPolicy,
       revalidation_timeout: int | None,
+      security_config_obj: Optional[security_config.SecurityConfig] = None,
       **kwargs
   ):
     self._policy = policy
     self._revalidation_timeout = revalidation_timeout
     if self._revalidation_timeout is None:
       self._revalidation_timeout = constants.DEFAULT_REVALIDATION_TIMEOUT
+    self._security_config = security_config_obj or security_config.SecurityConfig()
     super().__init__(**kwargs)
 
   def __repr__(self) -> str:
@@ -62,6 +65,7 @@ class AttestedHTTPSAdapter(requests.adapters.HTTPAdapter):
         block=block,
         policy=self._policy,
         revalidation_timeout=self._revalidation_timeout,
+        security_config_obj=self._security_config,
         **pool_kwargs
     )
 
@@ -77,6 +81,10 @@ class PromptEncryptionClient:
 
       # Or customize the interval
       client = PromptEncryptionClient(policy, revalidation_timeout=1800)
+      
+      # With security hardening
+      sec_config = SecurityConfig(enable_certificate_pinning=True, ...)
+      client = PromptEncryptionClient(policy, security_config=sec_config)
 
       with client.session() as session:
         response = session.post("https://server/infer", json=data)
@@ -85,16 +93,20 @@ class PromptEncryptionClient:
       policy: The security policy to enforce.
       revalidation_timeout: Seconds before a session is considered 'stale' and
         requires re-attestation. Default: 3300s (55m).
+      security_config: Optional SecurityConfig for hardening features.
   """
 
   policy: attestation_pb2.AttestationPolicy
   revalidation_timeout: int | None = None
+  security_config: Optional[security_config.SecurityConfig] = None
 
   def session(self) -> requests.Session:
     """Creates a new requests.Session with the Attested Adapter mounted."""
     session = requests.Session()
     adapter = AttestedHTTPSAdapter(
-        policy=self.policy, revalidation_timeout=self.revalidation_timeout
+        policy=self.policy,
+        revalidation_timeout=self.revalidation_timeout,
+        security_config_obj=self.security_config,
     )
     session.mount("https://", adapter)
     return session
