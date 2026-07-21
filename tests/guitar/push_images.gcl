@@ -1,0 +1,77 @@
+// Sandman sandbox to build and push container images to Artifact Registry for E2E tests.
+
+import '//production/borg/devtools-sandman/library/sandman_library.gcl' as sandman
+
+vars = {
+  // Service account address for docker push
+  gcr_robot_email = null
+
+  sandbox_name_prefix = 'attested-confidential-inference-pusher'
+  env_qualifier = real_username()
+}
+
+template sandlet PushImagesSandlet = sandman.generic_sandlet {
+  params = {}
+
+  provided_endpoint_interfaces = {}
+
+  operations = {
+    Start = {
+      parallel = {
+        push-client-image = {
+          command cmd-client = {
+            build_target docker_pusher = {
+              target =
+                  '//third_party/py/containerregistry/tools:internal_pusher.par'
+              download_runfiles = true
+            }
+            build_target image_tar = {
+              target =
+                  '//third_party/py/attested_confidential_inference/tests/e2e/scripts:client_image.tar'
+              download_runfiles = true
+            }
+            command_args = cond(
+                is_null(vars.gcr_robot_email),
+                [docker_pusher,
+                 '--name=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-client/base-client:latest',
+                 '--tarball', image_tar],
+                [docker_pusher,
+                 '--name=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-client/base-client:latest',
+                 '--tarball', image_tar, '--robot_email', vars.gcr_robot_email])
+          }
+        }
+        push-workload-image = {
+          command cmd-workload = {
+            build_target docker_pusher = {
+              target =
+                  '//third_party/py/containerregistry/tools:internal_pusher.par'
+              download_runfiles = true
+            }
+            build_target image_tar = {
+              target =
+                  '//third_party/py/attested_confidential_inference/tests/workloads/fastapi:workload_image.tar'
+              download_runfiles = true
+            }
+            command_args = cond(
+                is_null(vars.gcr_robot_email),
+                [docker_pusher,
+                 '--name=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-server/fastapi-sample-app:latest',
+                 '--tarball', image_tar],
+                [docker_pusher,
+                 '--name=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-server/fastapi-sample-app:latest',
+                 '--tarball', image_tar, '--robot_email', vars.gcr_robot_email])
+          }
+        }
+      }
+    }
+  }
+}
+
+template sandbox Unwired = {
+  instance_name = "%vars.sandbox_name_prefix%-%vars.env_qualifier%"
+
+  sandlet PushImages = PushImagesSandlet {}
+}
+
+sandbox PushImagesSandbox =
+    sandman.sandbox_with_aggregated_endpoints(Unwired) {}
