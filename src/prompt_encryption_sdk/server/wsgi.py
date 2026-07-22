@@ -27,6 +27,7 @@ from google.protobuf import json_format
 import gunicorn.app.base
 from gunicorn.http import wsgi as gunicorn_wsgi
 from gunicorn.workers import sync
+import tink
 import werkzeug.wrappers
 
 # Patch gunicorn to inject the socket into the environ.
@@ -179,7 +180,7 @@ class PromptEncryptionWSGIMiddleware:
       )
       return [error_json]
 
-    except (ValueError, TypeError, RuntimeError) as e:
+    except (ValueError, TypeError, RuntimeError, tink.TinkError) as e:
       logging.exception("Error during handling attest connection request")
       error_json = json.dumps(
           {"error": f"An internal server error occurred: {repr(e)}"}

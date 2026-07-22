@@ -40,3 +40,9 @@ EKM_LENGTH: int = 32
 DEFAULT_REVALIDATION_TIMEOUT: int = 3300
 NONCE_LENGTH: int = 32
 DEFAULT_AUDIENCE: str = "https://sts.google.com"
+
+# Tink key type URL for ML-DSA public keys
+ML_DSA_PUBLIC_KEY_TYPE_URL: str = (
+    "type.googleapis.com/google.crypto.tink.MlDsaPublicKey"
+)
+

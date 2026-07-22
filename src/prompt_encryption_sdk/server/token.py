@@ -31,6 +31,7 @@ from absl import logging
 from prompt_encryption_sdk.server import common
 from prompt_encryption_sdk.server import keys
 import jwt
+import tink
 
 TEE_SERVER_SOCKET_PATH = "/run/container_launcher/teeserver.sock"
 TOKEN_ENDPOINT = "/v1/token"
@@ -152,7 +153,7 @@ class TokenManager:
     )
 
   @staticmethod
-  def _fetch_attestation_token(public_key_fingerprint: str) -> bytes:
+  def _fetch_attestation_token(fingerprints: Sequence[str]) -> bytes:
     """Attempts to fetch attestation token based on configured attestation type."""
     attestation_type = os.environ.get("ATTESTATION_TYPE", "uds").lower()
 
@@ -160,31 +161,41 @@ class TokenManager:
       return get_cs_token_bytes(
           audience=DEFAULT_AUDIENCE,
           token_type=TOKEN_TYPE,
-          nonces=[public_key_fingerprint],
+          nonces=list(fingerprints),
       )
     elif attestation_type == "gotpm":
       return get_cvm_token_bytes(
-          audience=DEFAULT_AUDIENCE, nonces=[public_key_fingerprint]
+          audience=DEFAULT_AUDIENCE, nonces=list(fingerprints)
       )
     else:
       raise ValueError(f"Unknown ATTESTATION_TYPE {attestation_type!r}.")
 
   def refresh(self) -> None:
-    """Refreshes the public key and attestation token and saves them to files."""
+    """Refreshes the public keys and attestation token and saves them to files."""
     logging.info("Refreshing keys and attestation token...")
     with self._lock:
       self.key_manager.generate_key_pair()
-      public_key = self.key_manager.get_current_public_key()
-      public_key_fingerprint = keys.calculate_fingerprint(public_key)
+      ecdsa_pub = self.key_manager.get_current_public_key()
+      pqc_pub = self.key_manager.get_current_pqc_public_key()
 
-      attestation_token = self._fetch_attestation_token(public_key_fingerprint)
+      ecdsa_fingerprint = keys.calculate_fingerprint(ecdsa_pub)
+      pqc_fingerprint = keys.calculate_fingerprint(pqc_pub)
+
+      attestation_token = self._fetch_attestation_token(
+          [ecdsa_fingerprint, pqc_fingerprint]
+      )
       common.write_file(self.attestation_token_path, attestation_token, 0o644)
     logging.info("Refresh complete.")
 
   def get_public_key(self) -> bytes:
-    """Gets the current public key from the key manager."""
+    """Gets the current ECDSA public key from the key manager."""
     with self._lock:
       return self.key_manager.get_current_public_key()
+
+  def get_pqc_public_key(self) -> bytes:
+    """Gets the current PQC public keyset from the key manager."""
+    with self._lock:
+      return self.key_manager.get_current_pqc_public_key()
 
   def get_attestation_token(self) -> bytes:
     """Gets the current attestation token from its file."""
@@ -195,16 +206,21 @@ class TokenManager:
       except FileNotFoundError:
         return b""
 
-  def get_identity_snapshot(self) -> tuple[bytes, bytes]:
-    """Gets the current public key and attestation token together."""
+  def get_identity_snapshot(self) -> tuple[bytes, bytes, bytes]:
+    """Gets the current public keys and attestation token together.
+
+    Returns:
+      A tuple of (ecdsa_public_key, pqc_public_keyset, attestation_token)
+    """
     with self._lock:
-      public_key = self.key_manager.get_current_public_key()
+      ecdsa_pub = self.key_manager.get_current_public_key()
+      pqc_pub = self.key_manager.get_current_pqc_public_key()
       try:
         with open(self.attestation_token_path, "rb") as f:
           token = f.read()
       except FileNotFoundError:
         token = b""
-      return public_key, token
+      return ecdsa_pub, pqc_pub, token
 
   def _calculate_refresh_duration(self) -> float:
     """Calculates how long to sleep until the 90% mark, minus jitter."""
@@ -252,7 +268,7 @@ class TokenManager:
           break
         self.refresh()
 
-      except (OSError, RuntimeError, ValueError):
+      except (OSError, RuntimeError, ValueError, tink.TinkError):
         logging.exception("Refresher failed with unexpected error.")
         time.sleep(DEFAULT_RETRY_INTERVAL_SECONDS)
 

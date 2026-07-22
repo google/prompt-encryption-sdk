@@ -34,15 +34,21 @@ class AttestedTlsImplTest(absltest.TestCase):
     mock_token_manager = mock.create_autospec(token.TokenManager, instance=True)
     mock_token_manager.key_manager = mock_key_manager
     public_key = b"test_public_key"
+    pqc_public_key = b"test_pqc_public_key"
     attestation_token = b"test_attestation_token"
     signature = b"test_signature"
+    pqc_signature = b"test_pqc_signature"
     ekm_bytes = b"test_ekm"
 
     mock_token_manager.get_identity_snapshot.return_value = (
         public_key,
+        pqc_public_key,
         attestation_token,
     )
     mock_token_manager.key_manager.sign_payload.return_value = signature
+    mock_token_manager.key_manager.sign_payload_mldsa.return_value = (
+        pqc_signature
+    )
 
     mock_ssl_obj = mock.MagicMock()
     mock_ssl_obj.export_keying_material.return_value = ekm_bytes
@@ -64,6 +70,7 @@ class AttestedTlsImplTest(absltest.TestCase):
     )
 
     mock_token_manager.key_manager.sign_payload.assert_called_once()
+    mock_token_manager.key_manager.sign_payload_mldsa.assert_called_once()
     call_args = mock_token_manager.key_manager.sign_payload.call_args[0][0]
     actual_payload = attestation_pb2.SessionSignaturePayload.FromString(
         call_args
@@ -75,9 +82,13 @@ class AttestedTlsImplTest(absltest.TestCase):
           attestation_token,
       )
       self.assertEqual(response.session_signature, signature)
+      self.assertEqual(response.pqc_session_signature, pqc_signature)
 
     with self.subTest(name="PublicKeyPopulated"):
       self.assertEqual(response.instance_public_key.key_bytes, public_key)
+      self.assertEqual(
+          response.pqc_public_key.serialized_public_keyset, pqc_public_key
+      )
 
     with self.subTest(name="EKMSigned"):
       compare.assertProto2Equal(self, expected_payload, actual_payload)
@@ -125,6 +136,7 @@ class AttestedTlsImplTest(absltest.TestCase):
     mock_token_manager.key_manager = mock_key_manager
     mock_token_manager.get_identity_snapshot.return_value = (
         b"pk",
+        b"pqc_pk",
         b"token",
     )
     mock_token_manager.key_manager.sign_payload.return_value = b"sig"
@@ -150,6 +162,7 @@ class AttestedTlsImplTest(absltest.TestCase):
     mock_token_manager.key_manager = mock_key_manager
     mock_token_manager.get_identity_snapshot.return_value = (
         b"pk",
+        b"pqc_pk",
         b"token",
     )
     mock_token_manager.key_manager.sign_payload.return_value = b"sig"
@@ -169,7 +182,6 @@ class AttestedTlsImplTest(absltest.TestCase):
         ValueError, "Unsupported verifier types requested:"
     ):
       attested_tls_instance.attest_connection(request, ssl_obj=mock_ssl_obj)
-
 
 
 if __name__ == "__main__":

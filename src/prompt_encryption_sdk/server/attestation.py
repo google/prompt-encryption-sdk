@@ -20,7 +20,6 @@ from typing import Any
 from absl import logging
 from prompt_encryption_sdk.ekm import exporter
 from prompt_encryption_sdk.proto import attestation_pb2
-from prompt_encryption_sdk.server import keys
 from prompt_encryption_sdk.server import token
 
 _EKM_LABEL = b"EXPORTER-Prompt-Encryption-SDK"
@@ -100,13 +99,18 @@ class AttestedTLS:
             " the fallback exporter failed to extract keying material."
         )
 
-    public_key, attestation_token = self.token_manager.get_identity_snapshot()
+    ecdsa_pub, pqc_pub, attestation_token = (
+        self.token_manager.get_identity_snapshot()
+    )
     token_hash_bytes = hashlib.sha256(attestation_token).digest()
     ekm_hash_bytes = hashlib.sha256(ekm_bytes).digest()
     payload = attestation_pb2.SessionSignaturePayload(
         ekm_hash=ekm_hash_bytes, token_hash=token_hash_bytes
     )
-    signature = self.token_manager.key_manager.sign_payload(
+    ecdsa_signature = self.token_manager.key_manager.sign_payload(
+        payload.SerializeToString()
+    )
+    pqc_signature = self.token_manager.key_manager.sign_payload_mldsa(
         payload.SerializeToString()
     )
 
@@ -127,8 +131,12 @@ class AttestedTLS:
             )
         ],
         instance_public_key=attestation_pb2.EcdsaP256PublicKey(
-            key_bytes=public_key
+            key_bytes=ecdsa_pub
         ),
-        session_signature=signature,
+        session_signature=ecdsa_signature,
+        pqc_public_key=attestation_pb2.MlDsaPublicKey(
+            serialized_public_keyset=pqc_pub
+        ),
+        pqc_session_signature=pqc_signature,
     )
     return response

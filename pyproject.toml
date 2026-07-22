@@ -19,7 +19,7 @@ dependencies = [
     "protobuf",
     "PyJWT",
     "requests",
-    "tink",
+    "tink>=1.15.0",
     "urllib3",
     "grpcio"
 ]

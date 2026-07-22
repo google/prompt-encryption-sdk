@@ -219,9 +219,14 @@ class TokenManagerTest(parameterized.TestCase):
       expected_error_regex,
   ):
     with mock.patch.dict(os.environ, env_vars, clear=True):
-      public_key = b"test_public_key"
-      public_key_fingerprint = hashlib.sha256(public_key).hexdigest()
-      self.mock_key_manager.get_current_public_key.return_value = public_key
+      ecdsa_pub = b"test_ecdsa_public_key"
+      pqc_pub = b"test_pqc_public_keyset"
+
+      ecdsa_fingerprint = hashlib.sha256(ecdsa_pub).hexdigest()
+      pqc_fingerprint = hashlib.sha256(pqc_pub).hexdigest()
+
+      self.mock_key_manager.get_current_public_key.return_value = ecdsa_pub
+      self.mock_key_manager.get_current_pqc_public_key.return_value = pqc_pub
 
       if mock_cs_return is not None:
         mock_get_cs_token_bytes.return_value = mock_cs_return
@@ -244,14 +249,15 @@ class TokenManagerTest(parameterized.TestCase):
         mock_get_cs_token_bytes.assert_called_once_with(
             audience="https://sts.google.com",
             token_type="OIDC",
-            nonces=[public_key_fingerprint],
+            nonces=[ecdsa_fingerprint, pqc_fingerprint],
         )
       else:
         mock_get_cs_token_bytes.assert_not_called()
 
       if expect_cvm_call:
         mock_get_cvm_token_bytes.assert_called_once_with(
-            audience="https://sts.google.com", nonces=[public_key_fingerprint]
+            audience="https://sts.google.com",
+            nonces=[ecdsa_fingerprint, pqc_fingerprint],
         )
       else:
         mock_get_cvm_token_bytes.assert_not_called()
@@ -271,6 +277,13 @@ class TokenManagerTest(parameterized.TestCase):
     self.assertEqual(token_manager.get_public_key(), public_key)
     self.mock_key_manager.get_current_public_key.assert_called_once()
 
+  def test_get_pqc_public_key(self):
+    pqc_pub = b"test_pqc_public_keyset"
+    self.mock_key_manager.get_current_pqc_public_key.return_value = pqc_pub
+    token_manager = token.TokenManager(key_manager=self.mock_key_manager)
+    self.assertEqual(token_manager.get_pqc_public_key(), pqc_pub)
+    self.mock_key_manager.get_current_pqc_public_key.assert_called_once()
+
   def test_get_attestation_token(self):
     attestation_token = b"test_token"
     with open(self.attestation_token_path, "wb") as f:
@@ -287,6 +300,25 @@ class TokenManagerTest(parameterized.TestCase):
         attestation_token_path="/nonexistent/path",
     )
     self.assertEmpty(token_manager.get_attestation_token())
+
+  def test_get_identity_snapshot(self):
+    ecdsa_pub = b"test_ecdsa_public_key"
+    pqc_pub = b"test_pqc_public_keyset"
+    attestation_token = b"test_token"
+
+    self.mock_key_manager.get_current_public_key.return_value = ecdsa_pub
+    self.mock_key_manager.get_current_pqc_public_key.return_value = pqc_pub
+
+    with open(self.attestation_token_path, "wb") as f:
+      f.write(attestation_token)
+
+    token_manager = token.TokenManager(
+        key_manager=self.mock_key_manager,
+        attestation_token_path=self.attestation_token_path,
+    )
+
+    snapshot = token_manager.get_identity_snapshot()
+    self.assertEqual(snapshot, (ecdsa_pub, pqc_pub, attestation_token))
 
 
 if __name__ == "__main__":

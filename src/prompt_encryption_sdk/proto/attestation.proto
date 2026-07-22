@@ -43,10 +43,15 @@ message EcdsaP256PublicKey {
   bytes key_bytes = 1;
 }
 
+message MlDsaPublicKey {
+  bytes serialized_public_keyset = 1;
+}
+
 // SessionSignaturePayload binds the attestation to the TLS session.
 // It is signed by the server's private key.
 message SessionSignaturePayload {
-  // The raw 32-byte SHA-256 hash of the 32-byte Exported Keying Material (EKM) from the TLS session.
+  // The raw 32-byte SHA-256 hash of the 32-byte Exported Keying Material (EKM)
+  // from the TLS session.
   bytes ekm_hash = 1;
   // The raw 32-byte SHA-256 hash of the attestation token.
   bytes token_hash = 2;
@@ -62,6 +67,10 @@ message AttestConnectionResponse {
   // signature over a value derived from the TLS session's master secret.
   // This binds the attestation to this specific TLS session.
   bytes session_signature = 3;
+  // PQC public key
+  MlDsaPublicKey pqc_public_key = 4;
+  // PQC signature over the SessionSignaturePayload
+  bytes pqc_session_signature = 5;
 }
 
 // Enum for the supported TEE hardware CPU models.

@@ -15,7 +15,6 @@
 """Tests for server.keys."""
 
 import hashlib
-import os
 import pathlib
 from unittest import mock
 
@@ -29,17 +28,8 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 class KeysTest(absltest.TestCase):
 
-  @mock.patch.object(os, "replace", autospec=True)
-  @mock.patch.object(os, "fdopen")
-  @mock.patch.object(os, "open", autospec=True)
   @mock.patch.object(keys.ec, "generate_private_key", autospec=True)
-  def test_key_manager_generate_key_pair(
-      self,
-      mock_generate_private_key,
-      mock_os_open,
-      mock_os_fdopen,
-      mock_os_replace,
-  ):
+  def test_key_manager_generate_key_pair(self, mock_generate_private_key):
     mock_private_key = mock.create_autospec(
         ec.EllipticCurvePrivateKey, instance=True, spec_set=True
     )
@@ -57,17 +47,17 @@ class KeysTest(absltest.TestCase):
     temp_dir = self.create_tempdir()
     private_key_path = pathlib.Path(temp_dir.full_path, "private.pem")
     public_key_path = pathlib.Path(temp_dir.full_path, "public.pem")
+    pqc_private_key_path = pathlib.Path(temp_dir.full_path, "pqc_private.bin")
+    pqc_public_key_path = pathlib.Path(temp_dir.full_path, "pqc_public.bin")
 
-    mock_private_key_fd = 123
-    mock_public_key_fd = 456
-    mock_os_open.side_effect = [mock_private_key_fd, mock_public_key_fd]
-
-    mock_private_key_file = mock.mock_open()()
-    mock_public_key_file = mock.mock_open()()
-    mock_os_fdopen.side_effect = [mock_private_key_file, mock_public_key_file]
+    mock_write_file = mock.Mock(spec=common.FileWriter)
 
     key_manager = keys.KeyManager(
-        private_key_path=private_key_path, public_key_path=public_key_path
+        private_key_path=private_key_path,
+        public_key_path=public_key_path,
+        pqc_private_key_path=pqc_private_key_path,
+        pqc_public_key_path=pqc_public_key_path,
+        write_file_fn=mock_write_file,
     )
     public_key = key_manager.generate_key_pair()
 
@@ -78,34 +68,26 @@ class KeysTest(absltest.TestCase):
       mock_generate_private_key.assert_called_once()
 
     with self.subTest(name="KeysWritten"):
-      private_key_temp_path = private_key_path.with_name(
-          private_key_path.name + ".tmp"
-      )
-      public_key_temp_path = public_key_path.with_name(
-          public_key_path.name + ".tmp"
-      )
-      mock_os_open.assert_has_calls([
-          mock.call(
-              private_key_temp_path,
-              os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-              0o600,
-          ),
-          mock.call(
-              public_key_temp_path,
-              os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-              0o644,
-          ),
-      ])
-      mock_os_replace.assert_has_calls([
-          mock.call(private_key_temp_path, private_key_path),
-          mock.call(public_key_temp_path, public_key_path),
-      ])
-      mock_os_fdopen.assert_has_calls([
-          mock.call(mock_private_key_fd, "wb"),
-          mock.call(mock_public_key_fd, "wb"),
-      ])
-      mock_private_key_file.write.assert_called_once_with(pem_private_bytes)
-      mock_public_key_file.write.assert_called_once_with(pem_public_bytes)
+      self.assertEqual(mock_write_file.call_count, 4)
+      mock_write_file.assert_any_call(private_key_path, pem_private_bytes, 0o600)
+      mock_write_file.assert_any_call(public_key_path, pem_public_bytes, 0o644)
+
+      # Verify PQC writes
+      pqc_priv_call = [
+          c
+          for c in mock_write_file.call_args_list
+          if c[0][0] == pqc_private_key_path
+      ][0]
+      self.assertEqual(pqc_priv_call[0][2], 0o600)
+      self.assertIsInstance(pqc_priv_call[0][1], bytes)
+      self.assertNotEmpty(pqc_priv_call[0][1])
+
+      pqc_pub_call = [
+          c for c in mock_write_file.call_args_list if c[0][0] == pqc_public_key_path
+      ][0]
+      self.assertEqual(pqc_pub_call[0][2], 0o644)
+      self.assertIsInstance(pqc_pub_call[0][1], bytes)
+      self.assertNotEmpty(pqc_pub_call[0][1])
 
   def test_key_manager_get_current_public_key(self):
     public_key_bytes = b"test_public_key"
@@ -116,6 +98,18 @@ class KeysTest(absltest.TestCase):
 
     key_manager = keys.KeyManager(public_key_path=public_key_path)
     self.assertEqual(key_manager.get_current_public_key(), public_key_bytes)
+
+  def test_key_manager_get_current_pqc_public_key(self):
+    pqc_public_bytes = b"test_pqc_public_keyset"
+    temp_dir = self.create_tempdir()
+    pqc_public_key_path = pathlib.Path(temp_dir.full_path, "pqc_public.bin")
+    with open(pqc_public_key_path, "wb") as f:
+      f.write(pqc_public_bytes)
+
+    key_manager = keys.KeyManager(pqc_public_key_path=pqc_public_key_path)
+    self.assertEqual(
+        key_manager.get_current_pqc_public_key(), pqc_public_bytes
+    )
 
   def test_calculate_fingerprint(self):
     public_key = b"test_public_key"
@@ -143,6 +137,27 @@ class KeysTest(absltest.TestCase):
     self.assertIsNone(
         public_key.verify(signature, payload, ec.ECDSA(hashes.SHA256()))
     )
+
+  def test_key_manager_sign_payload_mldsa(self):
+    mldsa_template = keys.signature.signature_key_templates.ML_DSA_65
+    private_handle = keys.tink.new_keyset_handle(mldsa_template)
+
+    private_bytes = keys.tink.proto_keyset_format.serialize(
+        private_handle, keys.secret_key_access.TOKEN
+    )
+
+    temp_dir = self.create_tempdir()
+    pqc_private_key_path = pathlib.Path(temp_dir.full_path, "pqc_private.bin")
+    with open(pqc_private_key_path, "wb") as f:
+      f.write(private_bytes)
+
+    key_manager = keys.KeyManager(pqc_private_key_path=pqc_private_key_path)
+    payload = b"test_payload"
+    signature = key_manager.sign_payload_mldsa(payload)
+
+    public_handle = private_handle.public_keyset_handle()
+    verifier = public_handle.primitive(keys.signature.PublicKeyVerify)
+    self.assertIsNone(verifier.verify(signature, payload))
 
 
 if __name__ == "__main__":

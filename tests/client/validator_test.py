@@ -45,15 +45,18 @@ _FAKE_INSTANCE_NAME = "mhv-test-atls2"
 _FAKE_INSTANCE_ID = "2725765997796889912"
 _FAKE_PUB_KEY = b"fake-ecdsa-public-key-bytes"
 _FAKE_SESSION_SIGNATURE = b"fake-session-signature"
+_FAKE_PQC_PUB_KEY = b"fake-pqc-public-keyset-bytes"
+_FAKE_PQC_SESSION_SIGNATURE = b"fake-pqc-session-signature"
 _FAKE_CHALLENGE_NONCE = b"0123456789abcdef0123456789abcdef"
 
 
 def _get_valid_claims(nonce: bytes | None = None) -> dict[str, Any]:
   """Returns deterministic claims matching the GCA profile."""
-  pub_key_nonce = hashlib.sha256(_FAKE_PUB_KEY).hexdigest()
-  eat_nonce_list = (
-      [pub_key_nonce, nonce.hex()] if nonce else [pub_key_nonce]
-  )
+  ecdsa_nonce = hashlib.sha256(_FAKE_PUB_KEY).hexdigest()
+  pqc_nonce = hashlib.sha256(_FAKE_PQC_PUB_KEY).hexdigest()
+  eat_nonce_list = [ecdsa_nonce, pqc_nonce]
+  if nonce:
+    eat_nonce_list.append(nonce.hex())
 
   return {
       "hwmodel": "GCP_AMD_SEV",
@@ -95,24 +98,35 @@ class AttestationValidatorTest(parameterized.TestCase):
   # --- 1. Instance Key Binding Tests ---
 
   def test_verify_instance_key_binding_success(self):
-    """Tests that a matching public key hash passes validation."""
+    """Tests that matching public key hashes pass validation."""
     claims = _get_valid_claims()
-    self.validator._verify_instance_key_binding(claims, _FAKE_PUB_KEY)
+    self.validator._verify_instance_key_binding(
+        claims, _FAKE_PUB_KEY, _FAKE_PQC_PUB_KEY
+    )
 
-  def test_verify_instance_key_binding_single_string_nonce(self):
-    """Tests that validator handles 'eat_nonce' as a string instead of a list."""
-    pub_key_nonce = hashlib.sha256(_FAKE_PUB_KEY).hexdigest()
-    claims = {"eat_nonce": pub_key_nonce}
-    self.validator._verify_instance_key_binding(claims, _FAKE_PUB_KEY)
-
-  def test_verify_instance_key_binding_fails_on_mismatch(self):
-    """Tests that mismatched public key triggers an error."""
+  def test_verify_instance_key_binding_fails_on_mismatch_ecdsa(self):
+    """Tests that mismatched ECDSA public key triggers an error."""
     claims = _get_valid_claims()
     wrong_key = b"different-public-key-material"
     with self.assertRaisesRegex(
-        exceptions.AttestationVerificationError, "Instance Key binding failed"
+        exceptions.AttestationVerificationError,
+        "ECDSA Instance Key binding failed",
     ):
-      self.validator._verify_instance_key_binding(claims, wrong_key)
+      self.validator._verify_instance_key_binding(
+          claims, wrong_key, _FAKE_PQC_PUB_KEY
+      )
+
+  def test_verify_instance_key_binding_fails_on_mismatch_pqc(self):
+    """Tests that mismatched PQC public key triggers an error."""
+    claims = _get_valid_claims()
+    wrong_key = b"different-pqc-public-key-material"
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError,
+        "PQC Instance Key binding failed",
+    ):
+      self.validator._verify_instance_key_binding(
+          claims, _FAKE_PUB_KEY, wrong_key
+      )
 
   def test_verify_instance_key_binding_fails_on_empty_nonce(self):
     """Tests that missing eat_nonce claim triggers an error."""
@@ -121,7 +135,9 @@ class AttestationValidatorTest(parameterized.TestCase):
         exceptions.AttestationVerificationError,
         "No eat_nonce claim found in OIDC token.",
     ):
-      self.validator._verify_instance_key_binding(claims, _FAKE_PUB_KEY)
+      self.validator._verify_instance_key_binding(
+          claims, _FAKE_PUB_KEY, _FAKE_PQC_PUB_KEY
+      )
 
   def test_verify_instance_key_binding_fails_on_none_nonce(self):
     """Tests that eat_nonce claim being None triggers an error."""
@@ -130,26 +146,33 @@ class AttestationValidatorTest(parameterized.TestCase):
         exceptions.AttestationVerificationError,
         "No eat_nonce claim found in OIDC token.",
     ):
-      self.validator._verify_instance_key_binding(claims, _FAKE_PUB_KEY)
+      self.validator._verify_instance_key_binding(
+          claims, _FAKE_PUB_KEY, _FAKE_PQC_PUB_KEY
+      )
 
   def test_verify_nonce_success(self):
     """Tests that verification passes when the correct nonce is present."""
-    # We pass the nonce to the helper so it's included in the mock OIDC claims
     claims = _get_valid_claims(nonce=_FAKE_CHALLENGE_NONCE)
     self.validator._verify_instance_key_binding(
-        claims, _FAKE_PUB_KEY, expected_nonce=_FAKE_CHALLENGE_NONCE
+        claims,
+        _FAKE_PUB_KEY,
+        _FAKE_PQC_PUB_KEY,
+        expected_nonce=_FAKE_CHALLENGE_NONCE,
     )
 
   def test_verify_nonce_fails_on_mismatch(self):
-    """Tests that verification fails if the challenge nonce is missing from the token."""
-    # Claims only contains the pubkey hash, simulating a replayed/stale token
+    """Tests that verification fails if the challenge nonce is missing."""
     claims = _get_valid_claims(nonce=None)
     with self.assertRaisesRegex(
         exceptions.AttestationVerificationError, "Nonce verification failed"
     ):
       self.validator._verify_instance_key_binding(
-          claims, _FAKE_PUB_KEY, expected_nonce=_FAKE_CHALLENGE_NONCE
+          claims,
+          _FAKE_PUB_KEY,
+          _FAKE_PQC_PUB_KEY,
+          expected_nonce=_FAKE_CHALLENGE_NONCE,
       )
+
   # --- 2. Policy Enforcement Tests ---
 
   @parameterized.named_parameters(
@@ -308,12 +331,21 @@ class AttestationValidatorTest(parameterized.TestCase):
             self.validator, "_verify_session_signature", autospec=True
         )
     )
+    mock_verify_pqc_signature = self.enter_context(
+        mock.patch.object(
+            self.validator, "_verify_session_signature_mldsa", autospec=True
+        )
+    )
 
     response = attestation_pb2.AttestConnectionResponse(
         instance_public_key=attestation_pb2.EcdsaP256PublicKey(
             key_bytes=_FAKE_PUB_KEY
         ),
         session_signature=_FAKE_SESSION_SIGNATURE,
+        pqc_public_key=attestation_pb2.MlDsaPublicKey(
+            serialized_public_keyset=_FAKE_PQC_PUB_KEY
+        ),
+        pqc_session_signature=_FAKE_PQC_SESSION_SIGNATURE,
         evidence=[
             attestation_pb2.AttestationEvidence(
                 verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
@@ -331,6 +363,7 @@ class AttestationValidatorTest(parameterized.TestCase):
     )
     mock_oidc.assert_called_once_with(mock.ANY, "valid.jwt.payload")
     mock_verify_session_signature.assert_called_once()
+    mock_verify_pqc_signature.assert_called_once()
 
   def test_validate_nonce_mismatch_fails(self):
     """Tests that validate() raises an error if the challenge nonce is mismatched."""
@@ -347,6 +380,10 @@ class AttestationValidatorTest(parameterized.TestCase):
             key_bytes=_FAKE_PUB_KEY
         ),
         session_signature=_FAKE_SESSION_SIGNATURE,
+        pqc_public_key=attestation_pb2.MlDsaPublicKey(
+            serialized_public_keyset=_FAKE_PQC_PUB_KEY
+        ),
+        pqc_session_signature=_FAKE_PQC_SESSION_SIGNATURE,
         evidence=[
             attestation_pb2.AttestationEvidence(
                 verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
@@ -399,8 +436,8 @@ class AttestationValidatorTest(parameterized.TestCase):
     ):
       self.validator.validate(response, tls_ekm=b"")
 
-  def test_validate_missing_instance_public_key_fails(self):
-    """Tests failure when instance public key is missing."""
+  def test_validate_missing_ecdsa_public_key_fails(self):
+    """Tests failure when ECDSA public key is missing."""
     with mock.patch.object(
         self.validator._oidc_validator,
         "validate_token",
@@ -416,15 +453,20 @@ class AttestationValidatorTest(parameterized.TestCase):
                   ),
               ),
           ],
+          pqc_public_key=attestation_pb2.MlDsaPublicKey(
+              serialized_public_keyset=_FAKE_PQC_PUB_KEY
+          ),
+          pqc_session_signature=_FAKE_PQC_SESSION_SIGNATURE,
           # instance_public_key is missing
       )
       with self.assertRaisesRegex(
           exceptions.AttestationVerificationError,
-          "Instance public key is missing",
+          "ECDSA public key is missing",
       ):
         self.validator.validate(response, tls_ekm=b"")
 
-  def test_validate_missing_session_signature_fails(self):
+  def test_validate_missing_pqc_public_key_fails(self):
+    """Tests failure when PQC public key is missing."""
     with mock.patch.object(
         self.validator._oidc_validator,
         "validate_token",
@@ -443,11 +485,74 @@ class AttestationValidatorTest(parameterized.TestCase):
                   ),
               ),
           ],
+          session_signature=_FAKE_SESSION_SIGNATURE,
+          # pqc_public_key is missing
+      )
+      with self.assertRaisesRegex(
+          exceptions.AttestationVerificationError,
+          "PQC public key is missing",
+      ):
+        self.validator.validate(response, tls_ekm=b"")
+
+  def test_validate_missing_session_signature_fails(self):
+    with mock.patch.object(
+        self.validator._oidc_validator,
+        "validate_token",
+        return_value=_get_valid_claims(),
+        autospec=True,
+    ):
+      response = attestation_pb2.AttestConnectionResponse(
+          instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+              key_bytes=_FAKE_PUB_KEY
+          ),
+          pqc_public_key=attestation_pb2.MlDsaPublicKey(
+              serialized_public_keyset=_FAKE_PQC_PUB_KEY
+          ),
+          pqc_session_signature=_FAKE_PQC_SESSION_SIGNATURE,
+          evidence=[
+              attestation_pb2.AttestationEvidence(
+                  verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+                  gca_bundle=attestation_pb2.GcaTrustBundle(
+                      attestation_token="valid.jwt.payload"
+                  ),
+              ),
+          ],
           # session_signature is missing
       )
       with self.assertRaisesRegex(
           exceptions.AttestationVerificationError,
           "session signature is missing",
+      ):
+        self.validator.validate(response, tls_ekm=b"")
+
+  def test_validate_missing_pqc_session_signature_fails(self):
+    with mock.patch.object(
+        self.validator._oidc_validator,
+        "validate_token",
+        return_value=_get_valid_claims(),
+        autospec=True,
+    ):
+      response = attestation_pb2.AttestConnectionResponse(
+          instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+              key_bytes=_FAKE_PUB_KEY
+          ),
+          session_signature=_FAKE_SESSION_SIGNATURE,
+          pqc_public_key=attestation_pb2.MlDsaPublicKey(
+              serialized_public_keyset=_FAKE_PQC_PUB_KEY
+          ),
+          evidence=[
+              attestation_pb2.AttestationEvidence(
+                  verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+                  gca_bundle=attestation_pb2.GcaTrustBundle(
+                      attestation_token="valid.jwt.payload"
+                  ),
+              ),
+          ],
+          # pqc_session_signature is missing
+      )
+      with self.assertRaisesRegex(
+          exceptions.AttestationVerificationError,
+          "PQC session signature is missing",
       ):
         self.validator.validate(response, tls_ekm=b"")
 
@@ -463,12 +568,19 @@ class AttestationValidatorTest(parameterized.TestCase):
     self.enter_context(
         mock.patch.object(av, "_verify_session_signature", autospec=True)
     )
+    self.enter_context(
+        mock.patch.object(av, "_verify_session_signature_mldsa", autospec=True)
+    )
 
     response = attestation_pb2.AttestConnectionResponse(
         instance_public_key=attestation_pb2.EcdsaP256PublicKey(
             key_bytes=_FAKE_PUB_KEY
         ),
         session_signature=_FAKE_SESSION_SIGNATURE,
+        pqc_public_key=attestation_pb2.MlDsaPublicKey(
+            serialized_public_keyset=_FAKE_PQC_PUB_KEY
+        ),
+        pqc_session_signature=_FAKE_PQC_SESSION_SIGNATURE,
         evidence=[
             attestation_pb2.AttestationEvidence(
                 verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
@@ -514,8 +626,6 @@ class AttestationValidatorTest(parameterized.TestCase):
     claims = _get_valid_claims()
     mock_oidc.return_value = claims
 
-    # We wrap the existing methods in mocks so we can verify they were called
-    # while still allowing them to execute their logic.
     with mock.patch.object(
         self.validator, "_enforce_policy", wraps=self.validator._enforce_policy
     ) as spy_policy:
@@ -527,33 +637,49 @@ class AttestationValidatorTest(parameterized.TestCase):
         with mock.patch.object(
             self.validator,
             "_verify_session_signature",
-            wraps=self.validator._verify_session_signature,
+            autospec=True,
         ) as spy_sig:
-          response = attestation_pb2.AttestConnectionResponse(
-              instance_public_key=attestation_pb2.EcdsaP256PublicKey(
-                  key_bytes=_FAKE_PUB_KEY
-              ),
-              session_signature=_FAKE_SESSION_SIGNATURE,
-              evidence=[
-                  attestation_pb2.AttestationEvidence(
-                      verifier_type=(
-                          attestation_pb2.VerifierType.VERIFIER_TYPE_GCA
-                      ),
-                      gca_bundle=attestation_pb2.GcaTrustBundle(
-                          attestation_token="valid.jwt.payload"
-                      ),
-                  ),
-              ],
-          )
+          with mock.patch.object(
+              self.validator,
+              "_verify_session_signature_mldsa",
+              autospec=True,
+          ) as spy_pqc_sig:
+            response = attestation_pb2.AttestConnectionResponse(
+                instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+                    key_bytes=_FAKE_PUB_KEY
+                ),
+                session_signature=_FAKE_SESSION_SIGNATURE,
+                pqc_public_key=attestation_pb2.MlDsaPublicKey(
+                    serialized_public_keyset=_FAKE_PQC_PUB_KEY
+                ),
+                pqc_session_signature=_FAKE_PQC_SESSION_SIGNATURE,
+                evidence=[
+                    attestation_pb2.AttestationEvidence(
+                        verifier_type=(
+                            attestation_pb2.VerifierType.VERIFIER_TYPE_GCA
+                        ),
+                        gca_bundle=attestation_pb2.GcaTrustBundle(
+                            attestation_token="valid.jwt.payload"
+                        ),
+                    ),
+                ],
+            )
 
-          self.validator.validate(response, tls_ekm=b"fake_ekm_material")
+            self.validator.validate(response, tls_ekm=b"fake_ekm_material")
 
-          with self.subTest(name="enforce_policy_called"):
-            spy_policy.assert_called_once_with(claims)
-          with self.subTest(name="verify_instance_key_binding_called"):
-            spy_binding.assert_called_once_with(claims, _FAKE_PUB_KEY, expected_nonce=None)
-          with self.subTest(name="verify_session_signature_called"):
-            spy_sig.assert_called_once()
+            with self.subTest(name="enforce_policy_called"):
+              spy_policy.assert_called_once_with(claims)
+            with self.subTest(name="verify_instance_key_binding_called"):
+              spy_binding.assert_called_once_with(
+                  claims,
+                  ecdsa_pub_bytes=_FAKE_PUB_KEY,
+                  pqc_pub_bytes=_FAKE_PQC_PUB_KEY,
+                  expected_nonce=None,
+              )
+            with self.subTest(name="verify_session_signature_called"):
+              spy_sig.assert_called_once()
+            with self.subTest(name="verify_session_signature_mldsa_called"):
+              spy_pqc_sig.assert_called_once()
 
   # --- 5. Session Signature Verification Tests ---
   def test_verify_session_signature_success(self):
@@ -606,6 +732,116 @@ class AttestationValidatorTest(parameterized.TestCase):
     self.mock_pem_loader.assert_called_once_with(_FAKE_PUB_KEY)
     mock_pub_key.verify.assert_called_once_with(
         _FAKE_SESSION_SIGNATURE, payload, mock.ANY
+    )
+
+  @mock.patch.object(
+      validator.tink.proto_keyset_format,
+      "parse_without_secret",
+      autospec=True,
+  )
+  def test_verify_session_signature_mldsa_success(self, mock_parse):
+    mock_handle = mock.Mock()
+    mock_handle.keyset_info.return_value.key_info = [
+        mock.Mock(type_url=constants.ML_DSA_PUBLIC_KEY_TYPE_URL)
+    ]
+    mock_verifier = mock.Mock()
+    mock_handle.primitive.return_value = mock_verifier
+    mock_parse.return_value = mock_handle
+
+    pub_key_proto = attestation_pb2.MlDsaPublicKey(
+        serialized_public_keyset=_FAKE_PQC_PUB_KEY
+    )
+    payload = b"payload"
+
+    self.validator._verify_session_signature_mldsa(
+        pub_key_proto, signature=_FAKE_PQC_SESSION_SIGNATURE, payload=payload
+    )
+
+    mock_parse.assert_called_once_with(_FAKE_PQC_PUB_KEY)
+    mock_handle.primitive.assert_called_once_with(
+        validator.tink_signature.PublicKeyVerify
+    )
+    mock_verifier.verify.assert_called_once_with(
+        _FAKE_PQC_SESSION_SIGNATURE, payload
+    )
+
+  @mock.patch.object(
+      validator.tink.proto_keyset_format,
+      "parse_without_secret",
+      autospec=True,
+  )
+  def test_verify_session_signature_mldsa_fails(self, mock_parse):
+    mock_handle = mock.Mock()
+    mock_handle.keyset_info.return_value.key_info = [
+        mock.Mock(type_url=constants.ML_DSA_PUBLIC_KEY_TYPE_URL)
+    ]
+    mock_verifier = mock.Mock()
+    mock_verifier.verify.side_effect = Exception("verification failed")
+    mock_handle.primitive.return_value = mock_verifier
+    mock_parse.return_value = mock_handle
+
+    pub_key_proto = attestation_pb2.MlDsaPublicKey(
+        serialized_public_keyset=_FAKE_PQC_PUB_KEY
+    )
+    payload = b"payload"
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError,
+        "PQC session signature verification failed.",
+    ):
+      self.validator._verify_session_signature_mldsa(
+          pub_key_proto, signature=_FAKE_PQC_SESSION_SIGNATURE, payload=payload
+      )
+
+  @mock.patch.object(
+      validator.tink.proto_keyset_format,
+      "parse_without_secret",
+      autospec=True,
+  )
+  def test_verify_session_signature_mldsa_wrong_key_type(self, mock_parse):
+    mock_handle = mock.Mock()
+    mock_handle.keyset_info.return_value.key_info = [
+        mock.Mock(type_url="type.googleapis.com/google.crypto.tink.EcdsaPublicKey")
+    ]
+    mock_parse.return_value = mock_handle
+
+    pub_key_proto = attestation_pb2.MlDsaPublicKey(
+        serialized_public_keyset=_FAKE_PQC_PUB_KEY
+    )
+    payload = b"payload"
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError,
+        "PQC keyset key-type is not ML-DSA.",
+    ):
+      self.validator._verify_session_signature_mldsa(
+          pub_key_proto, signature=_FAKE_PQC_SESSION_SIGNATURE, payload=payload
+      )
+
+
+  def test_verify_session_signature_mldsa_integration(self):
+    """Tests ML-DSA signature verification using real Tink keysets without mocks."""
+    mldsa_template = validator.tink_signature.signature_key_templates.ML_DSA_65
+    private_handle = validator.tink.new_keyset_handle(mldsa_template)
+    public_handle = private_handle.public_keyset_handle()
+    serialized_pub_bytes = (
+        validator.tink.proto_keyset_format.serialize_without_secret(
+            public_handle
+        )
+    )
+
+    signer = private_handle.primitive(
+        validator.tink_signature.PublicKeySign
+    )
+    payload = b"test_payload_bytes"
+    signature_bytes = signer.sign(payload)
+
+    pub_key_proto = attestation_pb2.MlDsaPublicKey(
+        serialized_public_keyset=serialized_pub_bytes
+    )
+
+    self.validator._verify_session_signature_mldsa(
+        pub_key_proto, signature=signature_bytes, payload=payload
     )
 
 

@@ -21,6 +21,11 @@ from prompt_encryption_sdk.server import common
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+import tink
+from tink import secret_key_access
+from tink import signature
+
+signature.register()
 
 
 class KeyManager:
@@ -31,14 +36,22 @@ class KeyManager:
       *,
       private_key_path: pathlib.Path = pathlib.Path("/dev/shm/private_key.pem"),
       public_key_path: pathlib.Path = pathlib.Path("/dev/shm/public_key.pem"),
+      pqc_private_key_path: pathlib.Path = pathlib.Path(
+          "/dev/shm/mldsa_private.bin"
+      ),
+      pqc_public_key_path: pathlib.Path = pathlib.Path(
+          "/dev/shm/mldsa_public.bin"
+      ),
       write_file_fn: common.FileWriter | None = None,
       read_file_fn: common.FileReader | None = None,
   ):
     """Initializes the KeyManager.
 
     Args:
-        private_key_path: File path to store the private key.
-        public_key_path: File path to store the public key.
+        private_key_path: File path to store the ECDSA private key.
+        public_key_path: File path to store the ECDSA public key.
+        pqc_private_key_path: File path to store the PQC private keyset.
+        pqc_public_key_path: File path to store the PQC public keyset.
         write_file_fn: Function to write files. Defaults to the internal
           `common.write_file`.
         read_file_fn: Function to read files. Defaults to the internal
@@ -46,6 +59,8 @@ class KeyManager:
     """
     self.private_key_path = private_key_path
     self.public_key_path = public_key_path
+    self.pqc_private_key_path = pqc_private_key_path
+    self.pqc_public_key_path = pqc_public_key_path
     self._write_file_fn = (
         write_file_fn if write_file_fn is not None else common.write_file
     )
@@ -57,18 +72,25 @@ class KeyManager:
     return (
         f"KeyManager(private_key_path={self.private_key_path!r},"
         f" public_key_path={self.public_key_path!r},"
+        f" pqc_private_key_path={self.pqc_private_key_path!r},"
+        f" pqc_public_key_path={self.pqc_public_key_path!r},"
         f" write_file_fn={self._write_file_fn!r},"
         f" read_file_fn={self._read_file_fn!r})"
     )
 
   def generate_key_pair(self) -> bytes:
-    """Generates a new ECDSA P-256 key pair and returns the public key."""
+    """Generates ECDSA P-256 and ML-DSA-65 key pairs and saves them."""
     logging.info(
-        "Generating new key pair. Private key path: %s, Public key path: %s",
+        "Generating new key pairs. "
+        "ECDSA Private: %s, ECDSA Public: %s, "
+        "PQC Private: %s, PQC Public: %s",
         self.private_key_path,
         self.public_key_path,
+        self.pqc_private_key_path,
+        self.pqc_public_key_path,
     )
 
+    # 1. Generate Classical ECDSA Key Pair
     private_key = ec.generate_private_key(ec.SECP256R1())
     public_key = private_key.public_key()
 
@@ -86,16 +108,28 @@ class KeyManager:
     self._write_file_fn(self.private_key_path, pem_private, 0o600)
     self._write_file_fn(self.public_key_path, pem_public, 0o644)
 
-    logging.info(
-        "Successfully generated new key pair. Private key saved to: %s, Public"
-        " key saved to: %s",
-        self.private_key_path,
-        self.public_key_path,
+    # 2. Generate PQC ML-DSA-65 Key Pair using Tink
+    mldsa_template = signature.signature_key_templates.ML_DSA_65
+    pqc_private_handle = tink.new_keyset_handle(mldsa_template)
+    pqc_public_handle = pqc_private_handle.public_keyset_handle()
+
+    # Serialize PQC private keyset
+    pqc_private_bytes = tink.proto_keyset_format.serialize(
+        pqc_private_handle, secret_key_access.TOKEN
     )
+    self._write_file_fn(self.pqc_private_key_path, pqc_private_bytes, 0o600)
+
+    # Serialize PQC public keyset
+    pqc_public_bytes = tink.proto_keyset_format.serialize_without_secret(
+        pqc_public_handle
+    )
+    self._write_file_fn(self.pqc_public_key_path, pqc_public_bytes, 0o644)
+
+    logging.info("Successfully generated and saved ECDSA and PQC key pairs.")
     return pem_public
 
   def sign_payload(self, payload: bytes) -> bytes:
-    """Signs a payload using the private key.
+    """Signs a payload using the ECDSA private key.
 
     Args:
       payload: The bytes of the payload to be signed.
@@ -109,9 +143,29 @@ class KeyManager:
     )
     return private_key.sign(payload, ec.ECDSA(hashes.SHA256()))
 
+  def sign_payload_mldsa(self, payload: bytes) -> bytes:
+    """Signs a payload using the ML-DSA private key.
+
+    Args:
+      payload: The bytes of the payload to be signed.
+
+    Returns:
+      The ML-DSA signature of the payload.
+    """
+    pqc_private_bytes = self._read_file_fn(self.pqc_private_key_path)
+    pqc_private_handle = tink.proto_keyset_format.parse(
+        pqc_private_bytes, secret_key_access.TOKEN
+    )
+    signer = pqc_private_handle.primitive(signature.PublicKeySign)
+    return signer.sign(payload)
+
   def get_current_public_key(self) -> bytes:
-    """Reads and returns the public key bytes."""
+    """Reads and returns the ECDSA public key bytes."""
     return self._read_file_fn(self.public_key_path)
+
+  def get_current_pqc_public_key(self) -> bytes:
+    """Reads and returns the PQC public keyset bytes."""
+    return self._read_file_fn(self.pqc_public_key_path)
 
 
 def calculate_fingerprint(public_key: bytes) -> str:
