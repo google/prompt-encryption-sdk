@@ -22,7 +22,7 @@ template sandlet PushImagesSandlet = sandman.generic_sandlet {
           command cmd-client = {
             build_target docker_pusher = {
               target =
-                  '//third_party/py/containerregistry/tools:internal_pusher.par'
+                  '//third_party/bazel_rules/rules_docker/container/go/cmd/pusher:pusher'
               download_runfiles = true
             }
             build_target image_tar = {
@@ -33,18 +33,19 @@ template sandlet PushImagesSandlet = sandman.generic_sandlet {
             command_args = cond(
                 is_null(vars.gcr_robot_email),
                 [docker_pusher,
-                 '--name=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-client/base-client:latest',
-                 '--tarball', image_tar],
+                 '-dst=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-client/base-client:latest',
+                 '-tarball', image_tar, '-format=Docker'],
                 [docker_pusher,
-                 '--name=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-client/base-client:latest',
-                 '--tarball', image_tar, '--robot_email', vars.gcr_robot_email])
+                 '-dst=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-client/base-client:latest',
+                 '-tarball', image_tar, '-format=Docker', '-robot_email',
+                 vars.gcr_robot_email])
           }
         }
         push-workload-image = {
           command cmd-workload = {
             build_target docker_pusher = {
               target =
-                  '//third_party/py/containerregistry/tools:internal_pusher.par'
+                  '//third_party/bazel_rules/rules_docker/container/go/cmd/pusher:pusher'
               download_runfiles = true
             }
             build_target image_tar = {
@@ -55,11 +56,12 @@ template sandlet PushImagesSandlet = sandman.generic_sandlet {
             command_args = cond(
                 is_null(vars.gcr_robot_email),
                 [docker_pusher,
-                 '--name=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-server/fastapi-sample-app:latest',
-                 '--tarball', image_tar],
+                 '-dst=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-server/fastapi-sample-app:latest',
+                 '-tarball', image_tar, '-format=Docker'],
                 [docker_pusher,
-                 '--name=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-server/fastapi-sample-app:latest',
-                 '--tarball', image_tar, '--robot_email', vars.gcr_robot_email])
+                 '-dst=us-central1-docker.pkg.dev/confidential-ai-2/attested-tls-server/fastapi-sample-app:latest',
+                 '-tarball', image_tar, '-format=Docker', '-robot_email',
+                 vars.gcr_robot_email])
           }
         }
       }

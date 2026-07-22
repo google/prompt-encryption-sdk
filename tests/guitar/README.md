@@ -12,7 +12,7 @@ This directory contains the Guitar integration test suite for Attested Confident
            │
            ▼
   2. PUSH & SYNC PHASE (Sandman Engine runs `PushImagesSandbox` operations)
-           │  (Blocks until internal_pusher.par exits 0 ──► Sandbox state 'UP')
+           │  (Blocks until Go container pusher exits 0 ──► Sandbox state 'UP')
            ▼
   3. TEST RUN PHASE (Guitar Worker Node runs `blaze test`)
            │  (Runs guitar_prod_tests against Artifact Registry images)
@@ -28,7 +28,7 @@ This directory contains the Guitar integration test suite for Attested Confident
 
 2. **Push & Sync Phase (Sandman `operations`):**
    - Triggered by the Sandman Engine during pre-test environment setup.
-   - Executes `push_images.gcl` using Sandman `operations.Start` to run `internal_pusher.par` in parallel for both client and workload images.
+   - Executes `push_images.gcl` using Sandman `operations.Start` to run the Go container pusher (`//third_party/bazel_rules/rules_docker/container/go/cmd/pusher:pusher`) in parallel for both client and workload images.
    - Sandman **synchronously blocks and waits** until both pusher commands exit with status `0` before marking the sandbox state as `UP`. This guarantees images are fully uploaded to Artifact Registry before tests start without requiring `sleep` loops or health check hacks.
 
 3. **Test Run Phase:**
