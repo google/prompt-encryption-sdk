@@ -30,11 +30,7 @@ from google.protobuf import json_format
 import werkzeug.test
 
 
-
-
-class PromptEncryptionWSGIMiddlewareTest(
-    parameterized.TestCase
-):
+class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -109,9 +105,7 @@ class PromptEncryptionWSGIMiddlewareTest(
 
     # Mock the socket injection in environ
     environ_overrides = {
-        "prompt_encryption.socket": mock.create_autospec(
-            ssl.SSLSocket, instance=True
-        )
+        "prompt_encryption.socket": mock.create_autospec(ssl.SSLSocket, instance=True)
     }
 
     response = self.client.post(
@@ -134,6 +128,64 @@ class PromptEncryptionWSGIMiddlewareTest(
         environ_overrides["prompt_encryption.socket"],
         self.mw._attested_sockets,
     )
+
+  def test_mutual_socket_is_authorized_only_after_client_finish(self):
+    ssl_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    self.mw._attested_sockets.add(ssl_socket)
+    environ_overrides = {"prompt_encryption.socket": ssl_socket}
+    initial_request = attestation_pb2.AttestConnectionRequest(
+        required_verifier_type=[attestation_pb2.VERIFIER_TYPE_GCA],
+        nonce=b"c" * 32,
+        protocol_version=1,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+    )
+    initial_response = attestation_pb2.AttestConnectionResponse(
+        protocol_version=1,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        handshake_id=b"h" * 32,
+        server_nonce=b"s" * 32,
+    )
+    self.mock_attested_tls.attest_connection.return_value = initial_response
+    self.mock_attested_tls.completes_attestation.return_value = False
+
+    response = self.client.post(
+        "/_attest-connection",
+        json=json.loads(json_format.MessageToJson(initial_request)),
+        environ_overrides=environ_overrides,
+    )
+
+    self.assertEqual(response.status_code, http.HTTPStatus.OK)
+    self.assertNotIn(ssl_socket, self.mw._attested_sockets)
+
+    finish_request = attestation_pb2.AttestConnectionRequest(
+        required_verifier_type=[attestation_pb2.VERIFIER_TYPE_GCA],
+        nonce=b"c" * 32,
+        protocol_version=1,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        phase=attestation_pb2.ATTESTATION_HANDSHAKE_PHASE_CLIENT_FINISH,
+        handshake_id=b"h" * 32,
+        client_attestation=attestation_pb2.AttestationProof(
+            session_signature=b"client-proof"
+        ),
+    )
+    self.mock_attested_tls.attest_connection.return_value = (
+        attestation_pb2.AttestConnectionResponse(
+            protocol_version=1,
+            mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+            handshake_id=b"h" * 32,
+            mutual_attestation_complete=True,
+        )
+    )
+    self.mock_attested_tls.completes_attestation.return_value = True
+
+    response = self.client.post(
+        "/_attest-connection",
+        json=json.loads(json_format.MessageToJson(finish_request)),
+        environ_overrides=environ_overrides,
+    )
+
+    self.assertEqual(response.status_code, http.HTTPStatus.OK)
+    self.assertIn(ssl_socket, self.mw._attested_sockets)
 
   @parameterized.named_parameters(
       dict(
@@ -170,7 +222,12 @@ class PromptEncryptionWSGIMiddlewareTest(
       ),
   )
   def test_handle_attestation_errors(
-      self, json_body, environ_overrides, mock_error, expected_status, expected_error_substring
+      self,
+      json_body,
+      environ_overrides,
+      mock_error,
+      expected_status,
+      expected_error_substring,
   ):
     if mock_error:
       self.mock_attested_tls.attest_connection.side_effect = mock_error
@@ -309,9 +366,7 @@ class PromptEncryptionWSGIMiddlewareTest(
       worker.handle_request("listener", mock_req, mock_client, "addr")
 
     self.assertEqual(mock_req.confidential_socket, mock_client)
-    mock_super_handle.assert_called_once_with(
-        "listener", mock_req, mock_client, "addr"
-    )
+    mock_super_handle.assert_called_once_with("listener", mock_req, mock_client, "addr")
 
   def test_worker_handle_request_no_client(self):
     worker = self._create_worker()
@@ -324,9 +379,7 @@ class PromptEncryptionWSGIMiddlewareTest(
       worker.handle_request("listener", mock_req, mock_client, "addr")
 
     self.assertFalse(hasattr(mock_req, "confidential_socket"))
-    mock_super_handle.assert_called_once_with(
-        "listener", mock_req, mock_client, "addr"
-    )
+    mock_super_handle.assert_called_once_with("listener", mock_req, mock_client, "addr")
 
   def test_parse_request_error_handling(self):
     # Force _parse_request to hit the except block
@@ -336,9 +389,7 @@ class PromptEncryptionWSGIMiddlewareTest(
         side_effect=Exception("Boom"),
     ):
       environ_overrides = {
-          "prompt_encryption.socket": mock.create_autospec(
-              ssl.SSLSocket, instance=True
-          )
+          "prompt_encryption.socket": mock.create_autospec(ssl.SSLSocket, instance=True)
       }
       self.mock_attested_tls.attest_connection.return_value = (
           attestation_pb2.AttestConnectionResponse()
@@ -361,9 +412,7 @@ class StandaloneApplicationTest(absltest.TestCase):
     options = {"bind": "1.2.3.4:5678"}
 
     # Mock BaseApplication.__init__ to verify load_config separately and avoid side effects
-    with mock.patch(
-        "gunicorn.app.base.BaseApplication.__init__", return_value=None
-    ):
+    with mock.patch("gunicorn.app.base.BaseApplication.__init__", return_value=None):
       sa = wsgi._StandaloneApplication(app, options)
       # Manually set attributes normally set by __init__
       sa.application = app

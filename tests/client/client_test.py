@@ -27,17 +27,14 @@ class TestAttestedHTTPSAdapter(googletest.TestCase):
 
   def setUp(self):
     super().setUp()
-    self.mock_policy = mock.create_autospec(
-        client.attestation_pb2.AttestationPolicy
-    )
+    self.mock_policy = mock.create_autospec(client.attestation_pb2.AttestationPolicy)
     self.timeout = 123
     self.adapter = client.AttestedHTTPSAdapter(
         policy=self.mock_policy, revalidation_timeout=self.timeout
     )
 
   def test_init_sets_attributes_correctly(self):
-    """Tests that init stores policy and timeout correctly.
-    """
+    """Tests that init stores policy and timeout correctly."""
     self.assertEqual(self.adapter._policy, self.mock_policy)
     self.assertEqual(self.adapter._revalidation_timeout, self.timeout)
 
@@ -62,9 +59,7 @@ class TestAttestedHTTPSAdapter(googletest.TestCase):
     extra_kwarg = "something"
 
     # Act
-    self.adapter.init_poolmanager(
-        connections, maxsize, block=block, extra=extra_kwarg
-    )
+    self.adapter.init_poolmanager(connections, maxsize, block=block, extra=extra_kwarg)
 
     # Assert
     with self.subTest("InternalPoolAttributes"):
@@ -95,9 +90,7 @@ class TestPromptEncryptionClient(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    self.mock_policy = mock.create_autospec(
-        client.attestation_pb2.AttestationPolicy
-    )
+    self.mock_policy = mock.create_autospec(client.attestation_pb2.AttestationPolicy)
 
     # Mock constants to ensure stable testing regardless of actual file values
     self.mock_constants = self.enter_context(
@@ -122,6 +115,36 @@ class TestPromptEncryptionClient(parameterized.TestCase):
     self.assertEqual(sdk.revalidation_timeout, expected_timeout)
     self.assertEqual(sdk.policy, self.mock_policy)
 
+  def test_mutual_attestation_requires_client_token_manager(self):
+    with self.assertRaisesRegex(ValueError, "client_token_manager is required"):
+      client.PromptEncryptionClient(self.mock_policy, mutual_attestation=True)
+
+  @mock.patch.object(requests, "Session", autospec=True)
+  @mock.patch.object(client, "AttestedHTTPSAdapter", autospec=True)
+  @mock.patch.object(client.attestation_protocol, "AttestationProver", autospec=True)
+  def test_mutual_session_passes_client_prover_to_adapter(
+      self, mock_prover_cls, mock_adapter_cls, mock_session_cls
+  ):
+    identity = mock.MagicMock()
+    sdk = client.PromptEncryptionClient(
+        self.mock_policy,
+        mutual_attestation=True,
+        client_token_manager=identity,
+    )
+
+    sdk.session()
+
+    mock_prover_cls.assert_called_once_with(identity)
+    mock_adapter_cls.assert_called_once_with(
+        policy=self.mock_policy,
+        revalidation_timeout=None,
+        mutual_attestation=True,
+        attestation_prover=mock_prover_cls.return_value,
+    )
+    mock_session_cls.return_value.mount.assert_called_once_with(
+        "https://", mock_adapter_cls.return_value
+    )
+
   @mock.patch.object(requests, "Session", autospec=True)
   @mock.patch.object(client, "AttestedHTTPSAdapter", autospec=True)
   def test_session_creation_and_mounting(
@@ -129,11 +152,8 @@ class TestPromptEncryptionClient(parameterized.TestCase):
       mock_adapter_cls,
       mock_session_cls,
   ):
-    """Tests that session() creates a session and mounts the adapter correctly.
-    """
-    sdk = client.PromptEncryptionClient(
-        self.mock_policy, revalidation_timeout=777
-    )
+    """Tests that session() creates a session and mounts the adapter correctly."""
+    sdk = client.PromptEncryptionClient(self.mock_policy, revalidation_timeout=777)
 
     # Act
     session = sdk.session()
@@ -162,8 +182,7 @@ class TestPromptEncryptionClient(parameterized.TestCase):
 
   @mock.patch.object(client.PromptEncryptionClient, "session", autospec=True)
   def test_post_classmethod(self, mock_session_method):
-    """Tests that post() creates a client, opens a session, posts data, and returns result.
-    """
+    """Tests that post() creates a client, opens a session, posts data, and returns result."""
     # Setup
     url = "https://example.com/infer"
     data = {"key": "value"}
@@ -177,9 +196,7 @@ class TestPromptEncryptionClient(parameterized.TestCase):
     mock_sess_instance.post.return_value = expected_response
 
     # Act
-    result = client.PromptEncryptionClient.post(
-        self.mock_policy, url, data, **kwargs
-    )
+    result = client.PromptEncryptionClient.post(self.mock_policy, url, data, **kwargs)
 
     # Assert
     with self.subTest("ResultReturned"):

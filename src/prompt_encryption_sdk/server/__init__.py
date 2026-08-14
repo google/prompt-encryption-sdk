@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Server-side components for Prompt Encryption SDK."""
+"""Server and shared Confidential Space identity components.
 
-from prompt_encryption_sdk.server.asgi import PromptEncryptionASGIMiddleware
-from prompt_encryption_sdk.server.asgi import run_uvicorn_app
-from prompt_encryption_sdk.server.attestation import AttestedTLS
-from prompt_encryption_sdk.server.keys import KeyManager
-from prompt_encryption_sdk.server.token import TokenManager
-from prompt_encryption_sdk.server.wsgi import PromptEncryptionWSGIMiddleware
-from prompt_encryption_sdk.server.wsgi import run_gunicorn_app
+Imports are lazy so a mutual-attestation client can use KeyManager and
+TokenManager without installing ASGI, WSGI, Gunicorn, or Uvicorn dependencies.
+"""
+
+from importlib import import_module
+
 
 __all__ = (
     "AttestedTLS",
@@ -31,3 +30,29 @@ __all__ = (
     "run_gunicorn_app",
     "run_uvicorn_app",
 )
+
+_EXPORTS = {
+    "AttestedTLS": (".attestation", "AttestedTLS"),
+    "PromptEncryptionASGIMiddleware": (
+        ".asgi",
+        "PromptEncryptionASGIMiddleware",
+    ),
+    "PromptEncryptionWSGIMiddleware": (
+        ".wsgi",
+        "PromptEncryptionWSGIMiddleware",
+    ),
+    "KeyManager": (".keys", "KeyManager"),
+    "TokenManager": (".token", "TokenManager"),
+    "run_gunicorn_app": (".wsgi", "run_gunicorn_app"),
+    "run_uvicorn_app": (".asgi", "run_uvicorn_app"),
+}
+
+
+def __getattr__(name: str):
+  try:
+    module_name, attribute_name = _EXPORTS[name]
+  except KeyError as e:
+    raise AttributeError(name) from e
+  value = getattr(import_module(module_name, __name__), attribute_name)
+  globals()[name] = value
+  return value

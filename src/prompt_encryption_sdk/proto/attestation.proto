@@ -15,11 +15,42 @@ enum VerifierType {
   VERIFIER_TYPE_GCA = 1;
 }
 
+// AttestationMode is negotiated after the TLS handshake. The zero value is
+// intentionally server-only so requests from older clients retain their
+// existing behavior.
+enum AttestationMode {
+  ATTESTATION_MODE_SERVER_ONLY = 0;
+  ATTESTATION_MODE_MUTUAL = 1;
+}
+
+// AttestationHandshakePhase identifies the two mutual-attestation flights.
+enum AttestationHandshakePhase {
+  ATTESTATION_HANDSHAKE_PHASE_INITIAL = 0;
+  ATTESTATION_HANDSHAKE_PHASE_CLIENT_FINISH = 1;
+}
+
+// AttestationPeerRole prevents a proof produced by one side from being
+// reflected back and accepted as a proof for the other side.
+enum AttestationPeerRole {
+  ATTESTATION_PEER_ROLE_UNSPECIFIED = 0;
+  ATTESTATION_PEER_ROLE_SERVER = 1;
+  ATTESTATION_PEER_ROLE_CLIENT = 2;
+}
+
 message AttestConnectionRequest {
   // A list of verifiers that the server must be endorsed by.
   repeated VerifierType required_verifier_type = 1;
   // A random nonce for generating unique TLS session material.
   bytes nonce = 2;
+  // Protocol version 0 is the legacy server-only flow. Mutual attestation uses
+  // version 1 and fails closed if the peer does not echo it.
+  uint32 protocol_version = 3;
+  AttestationMode mode = 4;
+  AttestationHandshakePhase phase = 5;
+  // Opaque identifier issued by the server in the initial mutual response.
+  bytes handshake_id = 6;
+  // Present only in the mutual CLIENT_FINISH request.
+  AttestationProof client_attestation = 7;
 }
 
 // GcaTrustBundle contains the materials needed to verify a GCA-based
@@ -55,6 +86,33 @@ message SessionSignaturePayload {
   bytes ekm_hash = 1;
   // The raw 32-byte SHA-256 hash of the attestation token.
   bytes token_hash = 2;
+  // The following fields are omitted on the wire for legacy server-only
+  // proofs, preserving their existing canonical signed payload.
+  AttestationPeerRole peer_role = 3;
+  AttestationMode mode = 4;
+  // SHA-256 of MutualAttestationTranscript for mutual proofs.
+  bytes transcript_hash = 5;
+}
+
+// AttestationProof is role-neutral evidence that can be produced by either
+// endpoint. AttestConnectionResponse retains its original top-level proof
+// fields for compatibility with the existing client API.
+message AttestationProof {
+  repeated AttestationEvidence evidence = 1;
+  EcdsaP256PublicKey instance_public_key = 2;
+  bytes session_signature = 3;
+  MlDsaPublicKey pqc_public_key = 4;
+  bytes pqc_session_signature = 5;
+}
+
+// Canonical transcript for protocol version 1. Its deterministic serialized
+// form is hashed and used both as the EKM context and in each signed proof.
+message MutualAttestationTranscript {
+  uint32 protocol_version = 1;
+  AttestationMode mode = 2;
+  bytes client_nonce = 3;
+  bytes server_nonce = 4;
+  bytes handshake_id = 5;
 }
 
 // AttestConnectionResponse is sent by the server to the client. It is sent only
@@ -71,6 +129,13 @@ message AttestConnectionResponse {
   MlDsaPublicKey pqc_public_key = 4;
   // PQC signature over the SessionSignaturePayload
   bytes pqc_session_signature = 5;
+  // Mutual-attestation negotiation metadata. These fields are default/absent
+  // for the legacy server-only flow.
+  uint32 protocol_version = 6;
+  AttestationMode mode = 7;
+  bytes handshake_id = 8;
+  bytes server_nonce = 9;
+  bool mutual_attestation_complete = 10;
 }
 
 // Enum for the supported TEE hardware CPU models.

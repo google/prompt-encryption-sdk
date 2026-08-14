@@ -76,9 +76,7 @@ class PromptEncryptionWSGIMiddleware:
   def __repr__(self):
     return f"<{self.__class__.__name__} app={self.app!r}>"
 
-  def __call__(
-      self, environ: dict[str, Any], start_response
-  ) -> Iterable[bytes]:
+  def __call__(self, environ: dict[str, Any], start_response) -> Iterable[bytes]:
     path = environ.get("PATH_INFO", "")
 
     if path == "/_attest-connection":
@@ -130,9 +128,7 @@ class PromptEncryptionWSGIMiddleware:
         raise json_format.ParseError("Invalid JSON") from e
 
       if not isinstance(parsed_json, dict):
-        raise json_format.ParseError(
-            "Malformed JSON structure: Expected a dictionary"
-        )
+        raise json_format.ParseError("Malformed JSON structure: Expected a dictionary")
 
       req = json_format.ParseDict(
           parsed_json,
@@ -145,17 +141,22 @@ class PromptEncryptionWSGIMiddleware:
 
       if not ssl_obj:
         raise RuntimeError(
-            "TLS Socket not found. Server must be started via"
-            " run_gunicorn_app()"
+            "TLS Socket not found. Server must be started via" " run_gunicorn_app()"
         )
+
+      if (
+          req.mode == attestation_pb2.ATTESTATION_MODE_MUTUAL
+          and req.phase == attestation_pb2.ATTESTATION_HANDSHAKE_PHASE_INITIAL
+      ):
+        # Revalidation starts a new fail-closed mutual exchange.
+        self._attested_sockets.discard(ssl_obj)
 
       attestation_response_proto = self.attested_tls.attest_connection(
           req, ssl_obj=ssl_obj
       )
-      self._attested_sockets.add(ssl_obj)
-      attestation_response_dict = json_format.MessageToDict(
-          attestation_response_proto
-      )
+      if self.attested_tls.completes_attestation(req, attestation_response_proto):
+        self._attested_sockets.add(ssl_obj)
+      attestation_response_dict = json_format.MessageToDict(attestation_response_proto)
 
       response_data = json.dumps(attestation_response_dict).encode("utf-8")
 
@@ -222,6 +223,8 @@ def run_gunicorn_app(
     workers: int = 1,
     ssl_certfile: str | None = None,
     ssl_keyfile: str | None = None,
+    client_policy: attestation_pb2.AttestationPolicy | None = None,
+    require_mutual_attestation: bool = False,
     attested_tls_cls: type[attestation.AttestedTLS] = attestation.AttestedTLS,
     standalone_app_cls: type[gunicorn.app.base.BaseApplication] = (
         _StandaloneApplication
@@ -239,6 +242,9 @@ def run_gunicorn_app(
     workers: Number of workers.
     ssl_certfile: Path to SSL certificate file.
     ssl_keyfile: Path to SSL key file.
+    client_policy: Policy used to verify confidential clients. Providing it
+      enables mutual attestation.
+    require_mutual_attestation: Reject legacy server-only clients.
     attested_tls_cls: Dependency injection for AttestedTLS class.
     standalone_app_cls: Dependency injection for StandaloneApplication class.
     **kwargs: Additional keyword arguments to pass to Gunicorn options.
@@ -249,7 +255,13 @@ def run_gunicorn_app(
     token_manager = token.TokenManager(key_manager=key_manager)
 
   with token_manager:
-    atls = attested_tls_cls(token_manager)
+    attested_tls_kwargs = {}
+    if client_policy is not None or require_mutual_attestation:
+      attested_tls_kwargs.update(
+          client_policy=client_policy,
+          require_mutual_attestation=require_mutual_attestation,
+      )
+    atls = attested_tls_cls(token_manager, **attested_tls_kwargs)
     middleware_app = PromptEncryptionWSGIMiddleware(app, atls)
 
     options = {

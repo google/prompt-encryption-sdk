@@ -21,6 +21,7 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from prompt_encryption_sdk import attestation as attestation_protocol
 from prompt_encryption_sdk.client import connection
 from prompt_encryption_sdk.client import constants
 from prompt_encryption_sdk.client import exceptions
@@ -140,9 +141,7 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
       mock_super_request.assert_called_once()
 
   @mock.patch.object(HTTPSConnection, "request", autospec=True)
-  def test_request_failures_during_revalidation_close_socket(
-      self, mock_super_request
-  ):
+  def test_request_failures_during_revalidation_close_socket(self, mock_super_request):
     """Tests that revalidation failure closes socket and raises specific error."""
     self.conn.is_attested = True
     self.conn._last_attestation_time = time.time() - 200
@@ -168,9 +167,7 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
   def test_revalidate_session_raises_if_no_socket(self):
     """Tests check for closed socket before revalidation."""
     self.conn.sock = None
-    with self.assertRaisesRegex(
-        exceptions.PromptEncryptionError, "Socket is closed"
-    ):
+    with self.assertRaisesRegex(exceptions.PromptEncryptionError, "Socket is closed"):
       self.conn.revalidate_session()
 
   def test_revalidate_session_wraps_errors(self):
@@ -261,9 +258,7 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
     )
 
     # Verify validate was called with a Proto object and the EKM
-    mock_validator_inst.validate.assert_called_once_with(
-        mock.ANY, b"fake_ekm"
-    )
+    mock_validator_inst.validate.assert_called_once_with(mock.ANY, b"fake_ekm")
 
     # Verify timestamp updated
     self.assertNotEqual(self.conn._last_attestation_time, 0.0)
@@ -272,9 +267,7 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
   def test_handshake_network_error_sending(self, mock_req):
     """Tests handling of socket errors during request sending."""
     mock_req.side_effect = socket.error("Network down")
-    with self.assertRaisesRegex(
-        exceptions.AttestationHandshakeError, "Network error"
-    ):
+    with self.assertRaisesRegex(exceptions.AttestationHandshakeError, "Network error"):
       self.conn._perform_attestation_handshake()
 
   @mock.patch.object(HTTPSConnection, "request", autospec=True)
@@ -308,14 +301,111 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
     ):
       self.conn._perform_attestation_handshake()
 
+  def test_mutual_attestation_verifies_server_before_sending_client_proof(self):
+    prover = mock.MagicMock()
+    prover.create_proof.return_value = attestation_pb2.AttestationProof(
+        session_signature=b"client-proof"
+    )
+    conn = connection.AttestedHTTPSConnection(
+        host=self.host,
+        port=self.port,
+        policy=self.mock_policy,
+        mutual_attestation=True,
+        attestation_prover=prover,
+    )
+    conn.sock = mock.create_autospec(ssl.SSLSocket, instance=True)
+    conn._ekm_exporter_fn = mock.MagicMock(return_value=b"mutual-ekm")
+    client_nonce = b"c" * 32
+    initial_response = attestation_pb2.AttestConnectionResponse(
+        protocol_version=1,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        handshake_id=b"h" * 32,
+        server_nonce=b"s" * 32,
+    )
+    completion_response = attestation_pb2.AttestConnectionResponse(
+        protocol_version=1,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        handshake_id=b"h" * 32,
+        mutual_attestation_complete=True,
+    )
+    conn._send_attestation_request = mock.MagicMock(
+        side_effect=[initial_response, completion_response]
+    )
+    conn._validate_server_proof = mock.MagicMock()
+
+    conn._perform_mutual_attestation(client_nonce)
+
+    transcript = attestation_protocol.build_mutual_transcript(
+        client_nonce=client_nonce,
+        server_nonce=b"s" * 32,
+        handshake_id=b"h" * 32,
+    )
+    transcript_hash_bytes = attestation_protocol.transcript_hash(transcript)
+    conn._validate_server_proof.assert_called_once_with(
+        initial_response,
+        b"mutual-ekm",
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_SERVER,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        transcript_hash_bytes=transcript_hash_bytes,
+    )
+    prover.create_proof.assert_called_once_with(
+        b"mutual-ekm",
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        transcript_hash_bytes=transcript_hash_bytes,
+    )
+    initial_request, finish_request = (
+        call.args[0] for call in conn._send_attestation_request.call_args_list
+    )
+    self.assertEqual(
+        initial_request.phase,
+        attestation_pb2.ATTESTATION_HANDSHAKE_PHASE_INITIAL,
+    )
+    self.assertEqual(
+        finish_request.phase,
+        attestation_pb2.ATTESTATION_HANDSHAKE_PHASE_CLIENT_FINISH,
+    )
+    self.assertEqual(
+        finish_request.client_attestation.session_signature, b"client-proof"
+    )
+
+  def test_mutual_attestation_refuses_server_only_downgrade(self):
+    prover = mock.MagicMock()
+    conn = connection.AttestedHTTPSConnection(
+        host=self.host,
+        port=self.port,
+        policy=self.mock_policy,
+        mutual_attestation=True,
+        attestation_prover=prover,
+    )
+    conn._send_attestation_request = mock.MagicMock(
+        return_value=attestation_pb2.AttestConnectionResponse()
+    )
+    conn._validate_server_proof = mock.MagicMock()
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationHandshakeError, "server-only downgrade"
+    ):
+      conn._perform_mutual_attestation(b"c" * 32)
+
+    conn._validate_server_proof.assert_not_called()
+    prover.create_proof.assert_not_called()
+
+  def test_mutual_attestation_requires_client_identity(self):
+    with self.assertRaisesRegex(ValueError, "attestation_prover is required"):
+      connection.AttestedHTTPSConnection(
+          host=self.host,
+          port=self.port,
+          policy=self.mock_policy,
+          mutual_attestation=True,
+      )
+
 
 class AttestedHTTPSConnectionPoolTest(absltest.TestCase):
 
   def test_new_conn_creates_attested_connection(self):
     """Tests that the pool factory creates AttestedHTTPSConnection with correct args."""
-    policy = mock.create_autospec(
-        attestation_pb2.AttestationPolicy, instance=True
-    )
+    policy = mock.create_autospec(attestation_pb2.AttestationPolicy, instance=True)
     pool = connection.AttestedHTTPSConnectionPool(
         host="example.com",
         port=443,
@@ -331,9 +421,7 @@ class AttestedHTTPSConnectionPoolTest(absltest.TestCase):
     self.assertIsInstance(conn, connection.AttestedHTTPSConnection)
     self.assertEqual(conn.host, "example.com")
     self.assertEqual(conn._policy, policy)
-    self.assertEqual(
-        conn._revalidation_timeout, datetime.timedelta(seconds=500)
-    )
+    self.assertEqual(conn._revalidation_timeout, datetime.timedelta(seconds=500))
     # Verify SSL kwargs passed through
     self.assertEqual(conn.ca_certs, "/path/to/ca")
     self.assertEqual(conn.cert_reqs, "CERT_REQUIRED")
@@ -343,9 +431,7 @@ class AttestedPoolManagerTest(absltest.TestCase):
 
   def test_new_pool_https_returns_attested_pool(self):
     """Tests that HTTPS requests generate an AttestedPool."""
-    policy = mock.create_autospec(
-        attestation_pb2.AttestationPolicy, instance=True
-    )
+    policy = mock.create_autospec(attestation_pb2.AttestationPolicy, instance=True)
     manager = connection.AttestedPoolManager(
         policy=policy, revalidation_timeout=datetime.timedelta(seconds=123)
     )
@@ -354,9 +440,7 @@ class AttestedPoolManagerTest(absltest.TestCase):
 
     self.assertIsInstance(pool, connection.AttestedHTTPSConnectionPool)
     self.assertEqual(pool._policy, policy)
-    self.assertEqual(
-        pool._revalidation_timeout, datetime.timedelta(seconds=123)
-    )
+    self.assertEqual(pool._revalidation_timeout, datetime.timedelta(seconds=123))
 
   def test_new_pool_http_returns_standard_pool(self):
     """Tests that HTTP requests fallback to standard pools (no attestation)."""
