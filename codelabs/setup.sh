@@ -15,6 +15,11 @@ BACKEND_NAME="secure-inference-backend"
 FW_VLLM_NAME="allow-vllm-ingress"
 FW_HC_NAME="allow-hc-ingress"
 FWD_RULE_NAME="secure-inference-forwarding-rule"
+REQUIRE_MUTUAL_ATTESTATION="false"
+TRUSTED_CLIENT_IMAGE_HASH=""
+TRUSTED_CLIENT_PROJECT_ID=""
+TRUSTED_CLIENT_ZONE=""
+TRUSTED_CLIENT_HW_MODEL="TDX"
 
 usage() {
     echo "Usage: $0 --project-id <PROJECT_ID> [OPTIONS]"
@@ -30,6 +35,11 @@ usage() {
     echo "  --fw-vllm-name <FW_VLLM>       Default: allow-vllm-ingress"
     echo "  --fw-hc-name <FW_HC>           Default: allow-hc-ingress"
     echo "  --fwd-rule-name <FWD_RULE>     Default: secure-inference-forwarding-rule"
+    echo "  --mutual-attestation          Require the client to attest before inference"
+    echo "  --trusted-client-image-hash <HASH>  Required with --mutual-attestation"
+    echo "  --trusted-client-project-id <ID>    Default: server project"
+    echo "  --trusted-client-zone <ZONE>        Default: server zone"
+    echo "  --trusted-client-hw-model <MODEL>   TDX, SEV, or SEV_SNP (default: TDX)"
     exit 1
 }
 
@@ -47,6 +57,11 @@ while [[ "$#" -gt 0 ]]; do
         --fw-vllm-name) FW_VLLM_NAME="$2"; shift ;;
         --fw-hc-name) FW_HC_NAME="$2"; shift ;;
         --fwd-rule-name) FWD_RULE_NAME="$2"; shift ;;
+        --mutual-attestation) REQUIRE_MUTUAL_ATTESTATION="true" ;;
+        --trusted-client-image-hash) TRUSTED_CLIENT_IMAGE_HASH="$2"; shift ;;
+        --trusted-client-project-id) TRUSTED_CLIENT_PROJECT_ID="$2"; shift ;;
+        --trusted-client-zone) TRUSTED_CLIENT_ZONE="$2"; shift ;;
+        --trusted-client-hw-model) TRUSTED_CLIENT_HW_MODEL="$2"; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown parameter passed: $1"; usage ;;
     esac
@@ -60,6 +75,22 @@ fi
 
 if [ -z "${IMAGE_NAME}" ]; then
     IMAGE_NAME="gcr.io/${PROJECT_ID}/secure-vllm:v1"
+fi
+
+if [ "${REQUIRE_MUTUAL_ATTESTATION}" = "true" ]; then
+    if [ -z "${TRUSTED_CLIENT_IMAGE_HASH}" ]; then
+        echo "ERROR: --trusted-client-image-hash is required with --mutual-attestation."
+        exit 1
+    fi
+    TRUSTED_CLIENT_PROJECT_ID="${TRUSTED_CLIENT_PROJECT_ID:-${PROJECT_ID}}"
+    TRUSTED_CLIENT_ZONE="${TRUSTED_CLIENT_ZONE:-${ZONE}}"
+    case "${TRUSTED_CLIENT_HW_MODEL}" in
+        TDX|SEV|SEV_SNP) ;;
+        *)
+            echo "ERROR: --trusted-client-hw-model must be TDX, SEV, or SEV_SNP."
+            exit 1
+            ;;
+    esac
 fi
 
 if [ -z "${HF_TOKEN}" ]; then
@@ -131,6 +162,11 @@ echo "Waiting for IAM permissions to propagate..."
 sleep 60
 
 echo "Creating Confidential VM..."
+INSTANCE_METADATA="tee-image-reference=${IMAGE_NAME},tee-install-gpu-driver=true,tee-experiment-enable-confidential-gpu-support=true,tee-container-log-redirect=true,tee-mount-tmp=true,tee-env-GCS_BUCKET_NAME=${BUCKET_NAME}"
+if [ "${REQUIRE_MUTUAL_ATTESTATION}" = "true" ]; then
+    INSTANCE_METADATA="${INSTANCE_METADATA},tee-env-REQUIRE_MUTUAL_ATTESTATION=true,tee-env-TRUSTED_CLIENT_IMAGE_HASH=${TRUSTED_CLIENT_IMAGE_HASH},tee-env-TRUSTED_CLIENT_PROJECT_ID=${TRUSTED_CLIENT_PROJECT_ID},tee-env-TRUSTED_CLIENT_ZONE=${TRUSTED_CLIENT_ZONE},tee-env-TRUSTED_CLIENT_HW_MODEL=${TRUSTED_CLIENT_HW_MODEL}"
+fi
+
 gcloud compute instances create "${VM_NAME}" \
     --project="${PROJECT_ID}" \
     --zone="${ZONE}" \
@@ -145,7 +181,7 @@ gcloud compute instances create "${VM_NAME}" \
     --provisioning-model=SPOT \
     --shielded-secure-boot \
     --boot-disk-size=100GB \
-    --metadata="tee-image-reference=${IMAGE_NAME},tee-install-gpu-driver=true,tee-experiment-enable-confidential-gpu-support=true,tee-container-log-redirect=true,tee-mount-tmp=true,tee-env-GCS_BUCKET_NAME=${BUCKET_NAME}" || true
+    --metadata="${INSTANCE_METADATA}" || true
 
 echo "Configuring Network & Load Balancer..."
 gcloud compute firewall-rules create "${FW_VLLM_NAME}" \

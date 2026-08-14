@@ -59,6 +59,14 @@ The Prompt Encryption SDK strictly utilizes **Post-Handshake Attested TLS** for 
 *   **Strong Session Binding:** Using RFC 5705 EKM ensures the attestation is mathematically tied to the specific TLS session. Even though the assurance arrives "later," the cryptographic link prevents Replay and MitM attacks robustly.
 *   **Standardization Momentum:** Industry consensus and recent IETF drafts (e.g., `draft-fossati-tls-exported-attestation`) strongly favor post-handshake mechanisms for Confidential Computing due to their optimal balance of security and deployability.
 
+The SDK also supports an opt-in, versioned **mutual post-handshake attestation**
+exchange for deployments where the client runs in Confidential Space. In that
+mode the server proves its TEE identity first, the verified client returns its
+own role- and transcript-bound proof, and server middleware authorizes
+application traffic only after both checks pass. See
+[Mutual Post-Handshake Attested TLS](MUTUAL_ATTESTATION.md) for the state
+machine, API, compatibility, and downgrade analysis.
+
 ---
 
 ## Cryptographic Protocol Flow

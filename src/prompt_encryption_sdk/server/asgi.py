@@ -40,6 +40,11 @@ class TlsInjectorProtocol(H11Protocol):
       _loop=None,
       **kwargs,
   ):
+    # Newer Uvicorn versions read asgi_version in the protocol constructor.
+    # Config.load() normally resolves "auto" first, but embedders may provide
+    # an already-loaded config without that normalization.
+    if getattr(config, "interface", None) == "auto":
+      config.interface = "asgi3"
     super().__init__(config, server_state, app_state, _loop, **kwargs)
     self.original_app = self.app
 
@@ -123,9 +128,7 @@ class PromptEncryptionASGIMiddleware:
       raise json_format.ParseError("Invalid JSON") from e
 
     if not isinstance(parsed_json, dict):
-      raise json_format.ParseError(
-          "Malformed JSON structure: Expected a dictionary"
-      )
+      raise json_format.ParseError("Malformed JSON structure: Expected a dictionary")
 
     req = json_format.ParseDict(
         parsed_json,
@@ -139,19 +142,32 @@ class PromptEncryptionASGIMiddleware:
     if not ssl_obj:
       raise RuntimeError("TLS Socket not found.")
 
+    if (
+        req.mode == attestation_pb2.ATTESTATION_MODE_MUTUAL
+        and req.phase == attestation_pb2.ATTESTATION_HANDSHAKE_PHASE_INITIAL
+    ):
+      # Revalidation starts a new fail-closed mutual exchange. Do not leave a
+      # previously authorized socket usable between the two protocol flights.
+      self._attested_sockets.discard(ssl_obj)
+
     attestation_response_proto = self.attested_tls.attest_connection(
         req, ssl_obj=ssl_obj
     )
-    self._attested_sockets.add(ssl_obj)
-    attestation_response_dict = json_format.MessageToDict(
-        attestation_response_proto
-    )
+    if self.attested_tls.completes_attestation(req, attestation_response_proto):
+      self._attested_sockets.add(ssl_obj)
+    attestation_response_dict = json_format.MessageToDict(attestation_response_proto)
     response = responses.JSONResponse(attestation_response_dict)
     await response(scope, receive, send)
 
 
 def run_uvicorn_app(
-    app, *, key_manager=None, token_manager=None, **kwargs
+    app,
+    *,
+    key_manager=None,
+    token_manager=None,
+    client_policy: attestation_pb2.AttestationPolicy | None = None,
+    require_mutual_attestation: bool = False,
+    **kwargs,
 ) -> None:
   """Runs a uvicorn app with PromptEncryptionASGIMiddleware.
 
@@ -161,6 +177,9 @@ def run_uvicorn_app(
       one will be created.
     token_manager: An optional token.TokenManager instance. If not provided, a
       new one will be created using the key_manager.
+    client_policy: Policy used to verify confidential clients. Providing it
+      enables mutual attestation.
+    require_mutual_attestation: Reject legacy server-only clients.
     **kwargs: Additional keyword arguments to pass to uvicorn.run.
   """
   if key_manager is None:
@@ -171,6 +190,12 @@ def run_uvicorn_app(
   if "log_config" not in kwargs:
     kwargs["log_level"] = kwargs.get("log_level", "info")
   with token_manager:
-    atls = attestation.AttestedTLS(token_manager)
+    attested_tls_kwargs = {}
+    if client_policy is not None or require_mutual_attestation:
+      attested_tls_kwargs.update(
+          client_policy=client_policy,
+          require_mutual_attestation=require_mutual_attestation,
+      )
+    atls = attestation.AttestedTLS(token_manager, **attested_tls_kwargs)
     protected_app = PromptEncryptionASGIMiddleware(app, atls)
     uvicorn.run(protected_app, **kwargs)

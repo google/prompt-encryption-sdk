@@ -5,6 +5,7 @@ import pathlib
 import uuid
 
 from prompt_encryption_sdk import server
+from prompt_encryption_sdk.proto import attestation_pb2
 import fastapi
 from fastapi import responses
 from google.cloud import storage
@@ -13,6 +14,48 @@ import vllm
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
 os.environ["HF_HUB_OFFLINE"] = "1"
+
+_MutualAttestationConfig = tuple[attestation_pb2.AttestationPolicy | None, bool]
+
+
+def _mutual_attestation_config() -> _MutualAttestationConfig:
+  """Builds the trusted confidential-client policy from codelab settings."""
+  require_mutual = os.environ.get("REQUIRE_MUTUAL_ATTESTATION", "false").lower() in (
+      "1",
+      "true",
+      "yes",
+  )
+  client_image_hash = os.environ.get("TRUSTED_CLIENT_IMAGE_HASH", "")
+  if not client_image_hash:
+    if require_mutual:
+      raise ValueError(
+          "TRUSTED_CLIENT_IMAGE_HASH is required when mutual attestation is "
+          "required."
+      )
+    return None, False
+
+  hw_model_name = os.environ.get("TRUSTED_CLIENT_HW_MODEL", "TDX")
+  hw_model_by_name = {
+      "TDX": attestation_pb2.HARDWARE_MODEL_TDX,
+      "SEV": attestation_pb2.HARDWARE_MODEL_SEV,
+      "SEV_SNP": attestation_pb2.HARDWARE_MODEL_SEV_SNP,
+  }
+  try:
+    hw_model = hw_model_by_name[hw_model_name]
+  except KeyError as e:
+    raise ValueError(f"Unsupported TRUSTED_CLIENT_HW_MODEL: {hw_model_name!r}") from e
+
+  return (
+      attestation_pb2.AttestationPolicy(
+          hw_model=hw_model,
+          workload=attestation_pb2.WorkloadPolicy(image_hash=client_image_hash),
+          gce_instance=attestation_pb2.GceInstancePolicy(
+              project_id=os.environ.get("TRUSTED_CLIENT_PROJECT_ID", ""),
+              zone=os.environ.get("TRUSTED_CLIENT_ZONE", ""),
+          ),
+      ),
+      require_mutual,
+  )
 
 
 def download_model_from_gcs(bucket_name: str, model_dir: str) -> None:
@@ -58,19 +101,24 @@ async def completions(request: fastapi.Request) -> responses.JSONResponse:
   [completion_output] = request_output.outputs
   text = completion_output.text
 
-  return responses.JSONResponse({
-      "id": str(uuid.uuid4()),
-      "object": "text_completion",
-      "model": "google/gemma-3-1b-it",
-      "choices": [{"text": text, "index": 0}],
-  })
+  return responses.JSONResponse(
+      {
+          "id": str(uuid.uuid4()),
+          "object": "text_completion",
+          "model": "google/gemma-3-1b-it",
+          "choices": [{"text": text, "index": 0}],
+      }
+  )
 
 
 if __name__ == "__main__":
+  client_policy, require_mutual_attestation = _mutual_attestation_config()
   server.run_uvicorn_app(
       app,
       host="0.0.0.0",
       port=8000,
       ssl_keyfile="/tmp/server.key",
       ssl_certfile="/tmp/server.crt",
+      client_policy=client_policy,
+      require_mutual_attestation=require_mutual_attestation,
   )

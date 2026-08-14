@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y gcc libssl-dev openssl && rm -rf /var/l
 # Generate a self-signed certificate for TLS
 RUN openssl req -x509 -newkey rsa:4096 -keyout /tmp/server.key -out /tmp/server.crt -days 365 -nodes -subj "/CN=localhost"
 
-LABEL "tee.launch_policy.allow_env_override"="HF_HOME,GCS_BUCKET_NAME"
+LABEL "tee.launch_policy.allow_env_override"="HF_HOME,GCS_BUCKET_NAME,REQUIRE_MUTUAL_ATTESTATION,TRUSTED_CLIENT_IMAGE_HASH,TRUSTED_CLIENT_PROJECT_ID,TRUSTED_CLIENT_ZONE,TRUSTED_CLIENT_HW_MODEL"
 WORKDIR /app
 COPY examples/requirements.txt /app/requirements.txt
 
@@ -33,4 +33,3 @@ COPY examples/vllm_server.py /app/vllm_server.py
 
 EXPOSE 8000
 ENTRYPOINT ["python3", "vllm_server.py"]
-
