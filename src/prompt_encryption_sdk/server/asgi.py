@@ -18,6 +18,7 @@ import http
 import json
 import logging
 import weakref
+from prompt_encryption_sdk import attestation as attestation_protocol
 from prompt_encryption_sdk.proto import attestation_pb2
 from prompt_encryption_sdk.server import attestation
 from prompt_encryption_sdk.server import keys
@@ -79,6 +80,20 @@ class PromptEncryptionASGIMiddleware:
     if scope["path"] == "/_attest-connection":
       try:
         await self.handle_attestation(scope, receive, send)
+      except attestation_protocol.AttestationReplayError as e:
+        # The session already proved itself against an EKM that cannot change.
+        # Revoke it and close the connection rather than re-attesting it.
+        logging.warning("Dropping re-attestation on an attested session: %r", e)
+        replayed_socket = scope.get("extensions", {}).get("tls_socket")
+        if replayed_socket is not None:
+          self._attested_sockets.discard(replayed_socket)
+        error_response = responses.JSONResponse(
+            {"error": str(e)},
+            status_code=http.HTTPStatus.FORBIDDEN,
+            # Tells the ASGI server to tear down this TLS session.
+            headers={"Connection": "close"},
+        )
+        await error_response(scope, receive, send)
       except Exception as e:  # pylint: disable=broad-except
         logging.exception("Error during handling attest connection request")
         status_code = (
@@ -151,7 +166,13 @@ class PromptEncryptionASGIMiddleware:
 
 
 def run_uvicorn_app(
-    app, *, key_manager=None, token_manager=None, **kwargs
+    app,
+    *,
+    key_manager=None,
+    token_manager=None,
+    client_policy: attestation_pb2.AttestationPolicy | None = None,
+    require_mutual_attestation: bool = False,
+    **kwargs,
 ) -> None:
   """Runs a uvicorn app with PromptEncryptionASGIMiddleware.
 
@@ -161,6 +182,9 @@ def run_uvicorn_app(
       one will be created.
     token_manager: An optional token.TokenManager instance. If not provided, a
       new one will be created using the key_manager.
+    client_policy: Policy used to verify confidential clients. Providing it
+      enables mutual attestation.
+    require_mutual_attestation: Reject server-only clients.
     **kwargs: Additional keyword arguments to pass to uvicorn.run.
   """
   if key_manager is None:
@@ -171,6 +195,10 @@ def run_uvicorn_app(
   if "log_config" not in kwargs:
     kwargs["log_level"] = kwargs.get("log_level", "info")
   with token_manager:
-    atls = attestation.AttestedTLS(token_manager)
+    atls = attestation.AttestedTLS(
+        token_manager,
+        client_policy=client_policy,
+        require_mutual_attestation=require_mutual_attestation,
+    )
     protected_app = PromptEncryptionASGIMiddleware(app, atls)
     uvicorn.run(protected_app, **kwargs)

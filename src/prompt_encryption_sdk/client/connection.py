@@ -17,6 +17,12 @@
 This module defines `AttestedHTTPSConnection`, `AttestedHTTPSConnectionPool`,
 and `AttestedPoolManager` which extend urllib3's classes to perform
 attestation handshakes and session revalidation.
+
+Mutual attestation is a single round trip. The client exports the session EKM,
+signs its own proof over it, and sends that proof in the very first request;
+the server verifies it and answers with its own proof. Since the binding is
+the session EKM rather than a per-exchange nonce, a mutually attested session
+is never revalidated -- the server drops any session that tries.
 """
 
 import datetime
@@ -27,6 +33,7 @@ import socket
 import ssl
 import time
 
+from prompt_encryption_sdk import attestation as attestation_protocol
 from prompt_encryption_sdk.ekm import exporter as ekm_exporter
 from prompt_encryption_sdk.proto import attestation_pb2
 from google.protobuf import json_format
@@ -56,6 +63,12 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
       **kwargs,
   ):
     self._policy = kwargs.pop("policy", None)
+    self._mutual_attestation = kwargs.pop("mutual_attestation", False)
+    self._attestation_prover = kwargs.pop("attestation_prover", None)
+    if self._mutual_attestation and self._attestation_prover is None:
+      raise ValueError(
+          "attestation_prover is required when mutual_attestation is enabled."
+      )
     # Default revalidation timeout is 55 minutes.
     revalidation_timeout = kwargs.pop(
         "revalidation_timeout", datetime.timedelta(seconds=3300)
@@ -78,6 +91,7 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
     return (
         f"AttestedHTTPSConnection(host={self.host!r}, port={self.port}, "
         f"is_attested={self.is_attested}, "
+        f"mutual_attestation={self._mutual_attestation}, "
         f"revalidation_timeout={self._revalidation_timeout})"
     )
 
@@ -129,41 +143,12 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
       ) from e
 
   def _perform_attestation_handshake(self) -> None:
-    """Executes the attestation protocol (Request -> Response -> Validate)."""
-
-    # A. Generate a fresh nonce
-    nonce = secrets.token_bytes(constants.NONCE_LENGTH)
-
-    attestation_req = attestation_pb2.AttestConnectionRequest(
-        required_verifier_type=[attestation_pb2.VerifierType.VERIFIER_TYPE_GCA],
-        nonce=nonce,
-    )
-    json_body = json_format.MessageToJson(attestation_req)
-    # B. Send Request
+    """Executes server-only or mutual post-handshake attestation."""
     try:
-      # Note: We call the superclass's `request` method explicitly here to
-      # avoid a recursive loop during the handshake.
-      # Using HTTPConnection request method to send raw bytes.
-      super().request(
-          "POST",
-          constants.ATTESTATION_ENDPOINT,
-          body=json_body,
-          headers={
-              "Content-Type": "application/json",
-              "Accept": "application/json, application/x-protobuf",
-          },
-      )
-      response = self.getresponse()
-      attest_resp = self._process_attestation_response(response)
-
-      # D. Export Keying Material
-      tls_ekm = self._ekm_exporter_fn(
-          self.sock, constants.EKM_LENGTH, constants.EKM_LABEL, context=nonce  # pyrefly: ignore[bad-argument-type]
-      )
-
-      # E. Validate
-      att_validator = self._attestation_validator_cls(self._policy)
-      att_validator.validate(attest_resp, tls_ekm)
+      if self._mutual_attestation:
+        self._perform_mutual_attestation()
+      else:
+        self._perform_server_attestation()
 
       # Update timestamp on success
       self._last_attestation_time = time.time()
@@ -172,6 +157,108 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
       raise exceptions.AttestationHandshakeError(
           "Network error during attestation"
       ) from e
+
+  def _send_attestation_request(
+      self, request: attestation_pb2.AttestConnectionRequest
+  ) -> attestation_pb2.AttestConnectionResponse:
+    """Sends the attestation flight over the established TLS socket."""
+    json_body = json_format.MessageToJson(request)
+    # Note: We call the superclass's `request` method explicitly here to
+    # avoid a recursive loop during the handshake.
+    # Using HTTPConnection request method to send raw bytes.
+    super().request(
+        "POST",
+        constants.ATTESTATION_ENDPOINT,
+        body=json_body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, application/x-protobuf",
+        },
+    )
+    return self._process_attestation_response(self.getresponse())
+
+  def _perform_server_attestation(self) -> None:
+    """Runs the server-only exchange, challenging with a fresh client nonce."""
+    # A. Generate a fresh nonce
+    nonce = secrets.token_bytes(constants.NONCE_LENGTH)
+
+    attestation_req = attestation_pb2.AttestConnectionRequest(
+        required_verifier_type=[attestation_pb2.VerifierType.VERIFIER_TYPE_GCA],
+        nonce=nonce,
+    )
+    # B. Send Request
+    attest_resp = self._send_attestation_request(attestation_req)
+
+    # C. Export Keying Material
+    tls_ekm = self._ekm_exporter_fn(
+        self.sock, constants.EKM_LENGTH, constants.EKM_LABEL, context=nonce  # pyrefly: ignore[bad-argument-type]
+    )
+
+    # D. Validate
+    self._validate_server_proof(attest_resp, tls_ekm)
+
+  def _perform_mutual_attestation(self) -> None:
+    """Runs the one-round-trip mutual exchange.
+
+    The EKM is exported with no context, so both peers derive the same value
+    straight from the TLS session and neither has to contribute a nonce.
+    """
+    # A. Export Keying Material -- this is the challenge for both peers.
+    tls_ekm = self._ekm_exporter_fn(
+        self.sock, constants.EKM_LENGTH, constants.EKM_LABEL  # pyrefly: ignore[bad-argument-type]
+    )
+
+    # B. Prove our own identity before asking the server for its proof.
+    client_proof = self._attestation_prover.create_proof(
+        tls_ekm,
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+    )
+    request = attestation_pb2.AttestConnectionRequest(
+        required_verifier_type=[attestation_pb2.VERIFIER_TYPE_GCA],
+        protocol_version=(
+            attestation_protocol.MUTUAL_ATTESTATION_PROTOCOL_VERSION
+        ),
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        client_attestation=client_proof,
+    )
+    response = self._send_attestation_request(request)
+
+    # C. Fail closed unless the server echoed the mode we asked for. A server
+    # that answers with a server-only proof must not be silently accepted.
+    if (
+        response.protocol_version
+        != attestation_protocol.MUTUAL_ATTESTATION_PROTOCOL_VERSION
+        or response.mode != attestation_pb2.ATTESTATION_MODE_MUTUAL
+        or not response.mutual_attestation_complete
+    ):
+      raise exceptions.AttestationHandshakeError(
+          "Mutual attestation negotiation failed; refusing server-only"
+          " downgrade."
+      )
+
+    # D. Validate the server proof against the same binding.
+    self._validate_server_proof(
+        response,
+        tls_ekm,
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_SERVER,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+    )
+
+  def _validate_server_proof(
+      self,
+      response: attestation_pb2.AttestConnectionResponse,
+      tls_ekm: bytes,
+      **binding,
+  ) -> None:
+    """Validates a server proof and releases validator-owned resources."""
+    att_validator = self._attestation_validator_cls(self._policy)
+    try:
+      att_validator.validate(response, tls_ekm, **binding)
+    finally:
+      close = getattr(att_validator, "close", None)
+      if close is not None:
+        close()
 
   def connect(self) -> None:
     """Establishes the TLS connection and performs attestation."""
@@ -226,6 +313,11 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
 
   def _should_revalidate(self) -> bool:
     """Checks if the time since last attestation exceeds the timeout."""
+    # A mutual session binds to the session EKM, which never changes, so
+    # re-attesting it would prove nothing. The server drops such a session.
+    if self._mutual_attestation:
+      return False
+
     # Initial connection case
     if self._last_attestation_time == 0.0:
       return False
@@ -238,7 +330,16 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
     """Performs session revalidation on the existing connection.
 
     Triggers a fresh attestation handshake to verify key rotation and validity.
+
+    Raises:
+      exceptions.PromptEncryptionError: If the socket is closed, or if this is
+        a mutually attested session, which cannot be revalidated.
     """
+    if self._mutual_attestation:
+      raise exceptions.PromptEncryptionError(
+          "Mutually attested sessions cannot be revalidated. Open a new"
+          " connection to re-attest."
+      )
     if self.sock is None:
       raise exceptions.PromptEncryptionError(
           "Cannot revalidate: Socket is closed."
@@ -265,6 +366,8 @@ class AttestedHTTPSConnectionPool(connectionpool.HTTPSConnectionPool):
       *,
       port=None,
       policy=None,
+      mutual_attestation=False,
+      attestation_prover=None,
       revalidation_timeout=datetime.timedelta(seconds=3300),
       ekm_exporter_fn=ekm_exporter.export_keying_material,
       attestation_validator_cls=validator.AttestationValidator,
@@ -272,11 +375,15 @@ class AttestedHTTPSConnectionPool(connectionpool.HTTPSConnectionPool):
   ):
     kwargs.update({
         "policy": policy,
+        "mutual_attestation": mutual_attestation,
+        "attestation_prover": attestation_prover,
         "revalidation_timeout": revalidation_timeout,
         "ekm_exporter_fn": ekm_exporter_fn,
         "attestation_validator_cls": attestation_validator_cls,
     })
     self._policy = policy
+    self._mutual_attestation = mutual_attestation
+    self._attestation_prover = attestation_prover
     self._revalidation_timeout = revalidation_timeout
     super().__init__(host, port=port, **kwargs)
 
@@ -295,12 +402,16 @@ class AttestedPoolManager(poolmanager.PoolManager):
       self,
       *,
       policy=None,
+      mutual_attestation=False,
+      attestation_prover=None,
       revalidation_timeout=datetime.timedelta(seconds=3300),
       ekm_exporter_fn=ekm_exporter.export_keying_material,
       attestation_validator_cls=validator.AttestationValidator,
       **kwargs,
   ):
     self._policy = policy
+    self._mutual_attestation = mutual_attestation
+    self._attestation_prover = attestation_prover
     self._revalidation_timeout = revalidation_timeout
     self._ekm_exporter_fn = ekm_exporter_fn
     self._attestation_validator_cls = attestation_validator_cls
@@ -321,6 +432,8 @@ class AttestedPoolManager(poolmanager.PoolManager):
           host,
           port=port,
           policy=self._policy,
+          mutual_attestation=self._mutual_attestation,
+          attestation_prover=self._attestation_prover,
           ekm_exporter_fn=self._ekm_exporter_fn,
           attestation_validator_cls=self._attestation_validator_cls,
           revalidation_timeout=self._revalidation_timeout,
