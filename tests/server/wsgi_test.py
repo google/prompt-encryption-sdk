@@ -29,12 +29,7 @@ from prompt_encryption_sdk.server import wsgi
 from google.protobuf import json_format
 import werkzeug.test
 
-
-
-
-class PromptEncryptionWSGIMiddlewareTest(
-    parameterized.TestCase
-):
+class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()

@@ -459,6 +459,7 @@ class TlsInjectorProtocolTest(absltest.TestCase):
       config = uvicorn.Config(original_app)
       config.ws_protocol_class = None
       config.loaded = True
+      config.interface = "asgi3"
       config.loaded_app = original_app
       server_state = mock.MagicMock()
       app_state = {}
@@ -488,6 +489,7 @@ class TlsInjectorProtocolTest(absltest.TestCase):
       config = uvicorn.Config(original_app)
       config.ws_protocol_class = None
       config.loaded = True
+      config.interface = "asgi3"
       config.loaded_app = original_app
       server_state = mock.MagicMock()
       app_state = {}
@@ -514,6 +516,7 @@ class TlsInjectorProtocolTest(absltest.TestCase):
       config = uvicorn.Config(original_app)
       config.ws_protocol_class = None
       config.loaded = True
+      config.interface = "asgi3"
       config.loaded_app = original_app
       server_state = mock.MagicMock()
       app_state = {}
@@ -542,6 +545,7 @@ class TlsInjectorProtocolTest(absltest.TestCase):
       config = uvicorn.Config(original_app)
       config.ws_protocol_class = None
       config.loaded = True
+      config.interface = "asgi3"
       config.loaded_app = original_app
       server_state = mock.MagicMock()
       app_state = {}
@@ -572,6 +576,7 @@ class TlsInjectorProtocolTest(absltest.TestCase):
       config = uvicorn.Config(original_app)
       config.ws_protocol_class = None
       config.loaded = True
+      config.interface = "asgi3"
       config.loaded_app = original_app
       server_state = mock.MagicMock()
       app_state = {}

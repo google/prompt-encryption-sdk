@@ -25,8 +25,6 @@ from prompt_encryption_sdk.server import keys
 from prompt_encryption_sdk.server import token
 
 
-
-
 class AttestedTlsImplTest(absltest.TestCase):
 
   def test_attest_connection_success(self):
@@ -91,7 +89,7 @@ class AttestedTlsImplTest(absltest.TestCase):
       )
 
     with self.subTest(name="EKMSigned"):
-      compare.assertProto2Equal(self, expected_payload, actual_payload)
+      self.assertEqual(expected_payload, actual_payload)
 
   @mock.patch.object(exporter, "export_keying_material", autospec=True)
   def test_attest_connection_ekm_extraction_fails(
