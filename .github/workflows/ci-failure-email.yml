@@ -1,0 +1,43 @@
+name: CI Failure Email
+
+on:
+  workflow_run:
+    workflows:
+      - SDK CI
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: Email maintainers
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      # Always check out the trusted default branch. Do not check out the failed
+      # workflow's head SHA because workflow_run can be triggered by fork PRs.
+      - name: Check out notification script
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Send failure email
+        env:
+          CI_FAILURE_RECIPIENTS: patilatul@google.com,ashpaw@google.com,nilanjandaw@google.com
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          CI_WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          CI_EVENT: ${{ github.event.workflow_run.event }}
+          CI_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          CI_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          CI_ACTOR: ${{ github.event.workflow_run.actor.login }}
+          SMTP_HOST: ${{ secrets.CI_SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.CI_SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.CI_SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.CI_SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.CI_SMTP_FROM }}
+          SMTP_SECURITY: ${{ secrets.CI_SMTP_SECURITY }}
+        run: python .github/scripts/send_failure_email.py
