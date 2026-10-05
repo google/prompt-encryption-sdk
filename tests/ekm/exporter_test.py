@@ -89,7 +89,7 @@ class ExporterUnitTest(parameterized.TestCase):
   def test_export_rejects_none_socket(self):
     """Ensures None is rejected with a clear TypeError."""
     with self.assertRaisesRegex(TypeError, "Socket cannot be None"):
-      exporter.export_keying_material(None, 32, b"LABEL")  # pytype: disable=wrong-arg-types
+      exporter.export_keying_material(None, 32, b"LABEL")  # pyrefly: ignore[bad-argument-type]
     self.mock_ekm_export.assert_not_called()
 
   def test_export_rejects_non_ssl_objects(self):
@@ -100,7 +100,7 @@ class ExporterUnitTest(parameterized.TestCase):
     with self.assertRaisesRegex(
         TypeError, "does not appear to be a valid SSL socket object"
     ):
-      exporter.export_keying_material(non_ssl_sock, 32, b"LABEL")  # pytype: disable=wrong-arg-types
+      exporter.export_keying_material(non_ssl_sock, 32, b"LABEL")  # pyrefly: ignore[bad-argument-type]
     self.mock_ekm_export.assert_not_called()
 
   def test_export_rejects_arbitrary_objects(self):
@@ -108,7 +108,7 @@ class ExporterUnitTest(parameterized.TestCase):
     with self.assertRaisesRegex(
         TypeError, "does not appear to be a valid SSL socket object"
     ):
-      exporter.export_keying_material("i am not a socket", 32, b"LABEL")  # pytype: disable=wrong-arg-types
+      exporter.export_keying_material("i am not a socket", 32, b"LABEL")  # pyrefly: ignore[bad-argument-type]
     self.mock_ekm_export.assert_not_called()
 
 
