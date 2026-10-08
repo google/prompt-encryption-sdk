@@ -63,6 +63,42 @@ def _safe_get_map(data: Any, key: str) -> Mapping[str, Any]:
   return val
 
 
+def _parse_image_signatures(
+    container_claims: Mapping[str, Any],
+) -> tuple[set[str], set[str]]:
+  """Extracts key IDs and algorithm-qualified signatures from container claims.
+
+  Args:
+      container_claims: The `submods.container` claims mapping from the token.
+
+  Returns:
+      A tuple of `(token_key_ids, token_exact_signatures)` where:
+      - `token_key_ids` contains all non-empty `key_id` strings.
+      - `token_exact_signatures` contains all `"<signature_algorithm>:<key_id>"`
+        strings for signatures that specify both fields.
+
+  Raises:
+      PolicyViolationError: If `image_signatures` is not a list of mappings.
+  """
+  signatures = container_claims.get("image_signatures", [])
+  if not isinstance(signatures, list) or not all(
+      isinstance(sig, Mapping) for sig in signatures
+  ):
+    raise exceptions.PolicyViolationError("Malformed image signatures claim.")
+
+  token_key_ids: set[str] = set()
+  token_exact_signatures: set[str] = set()
+  for sig in signatures:
+    key_id = sig.get("key_id")
+    if isinstance(key_id, str) and key_id:
+      token_key_ids.add(key_id)
+      sig_alg = sig.get("signature_algorithm")
+      if isinstance(sig_alg, str) and sig_alg:
+        token_exact_signatures.add(f"{sig_alg}:{key_id}")
+
+  return token_key_ids, token_exact_signatures
+
+
 class OIDCTokenValidator:
   """Validates OIDC tokens issued by Confidential Space using PyJWT."""
 
@@ -308,27 +344,35 @@ class AttestationValidator:
               f" {workload_policy.image_hash}, got {token_digest}"
           )
 
-      # 2b. Signing Key Validation (Workload Image Signature)
-      # Validates if any of the image signatures were produced by the trusted key
-      if workload_policy.signing_key_id:
-        signatures = container_claims.get("image_signatures", [])
-        if not isinstance(signatures, list) or not all(
-            isinstance(sig, Mapping) for sig in signatures
-        ):
-          raise exceptions.PolicyViolationError(
-              "Malformed image signatures claim."
-          )
-        # Check if any signature key_id matches the policy
-        found_key = any(
-            sig.get("key_id") == workload_policy.signing_key_id
-            for sig in signatures
+      if workload_policy.signing_key_id or workload_policy.image_signatures:
+        token_key_ids, token_exact_signatures = _parse_image_signatures(
+            container_claims
         )
 
-        if not found_key:
+        # 2b. Signing Key Validation (Workload Image Signature)
+        # Validates if any of the image signatures were produced by the trusted
+        # key.
+        if (
+            workload_policy.signing_key_id
+            and workload_policy.signing_key_id not in token_key_ids
+        ):
           raise exceptions.PolicyViolationError(
               "Workload image not signed by trusted key:"
               f" {workload_policy.signing_key_id}"
           )
+
+        # 2c. Multi-Signature Consensus Validation (Cosign Public Key
+        # Fingerprints). Ensures that ALL required public key
+        # fingerprints/signatures are present.
+        for required_sig in workload_policy.image_signatures:
+          expected_signatures = (
+              token_exact_signatures if ":" in required_sig else token_key_ids
+          )
+          if required_sig not in expected_signatures:
+            raise exceptions.PolicyViolationError(
+                f"Missing required container image signature: {required_sig}."
+                f" Found signatures: {sorted(expected_signatures)}"
+            )
 
     # 3. GCE Instance Policy Validation
     # These properties ensure the workload runs in the correct project/zone
@@ -476,4 +520,3 @@ class AttestationValidator:
       raise exceptions.AttestationVerificationError(
           "PQC session signature verification failed."
       ) from e
-

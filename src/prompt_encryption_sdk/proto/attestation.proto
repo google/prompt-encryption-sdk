@@ -90,6 +90,19 @@ message WorkloadPolicy {
   // e.g.,
   // "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/v"
   string signing_key_id = 2;
+
+  // The expected container image signatures (N-of-N multi-signature consensus).
+  // Every entry listed here must match a verified signature in the attestation
+  // token's `submods.container.image_signatures` claim.
+  //
+  // Supported entry formats:
+  // - "<key_id>": Matches any verified signature with the given public key
+  //   fingerprint (SHA-256 hex digest of the DER-encoded public key),
+  //   regardless of signing algorithm.
+  // - "<signature_algorithm>:<key_id>": Matches only a verified signature that
+  //   uses both the specified signing algorithm (e.g., "ECDSA_P256_SHA256",
+  //   "RSASSA_PSS_SHA256", "RSASSA_PKCS1V15_SHA256") and the given key_id.
+  repeated string image_signatures = 3;
 }
 
 // Defines the expected properties of the GCE instance running the workload.

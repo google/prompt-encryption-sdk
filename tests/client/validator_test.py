@@ -48,6 +48,9 @@ _FAKE_SESSION_SIGNATURE = b"fake-session-signature"
 _FAKE_PQC_PUB_KEY = b"fake-pqc-public-keyset-bytes"
 _FAKE_PQC_SESSION_SIGNATURE = b"fake-pqc-session-signature"
 _FAKE_CHALLENGE_NONCE = b"0123456789abcdef0123456789abcdef"
+_FAKE_KEY_ID_1 = "key_fingerprint_1"
+_FAKE_KEY_ID_2 = "key_fingerprint_2"
+_FAKE_KEY_ID_3 = "key_fingerprint_3"
 
 
 def _get_valid_claims(nonce: bytes | None = None) -> dict[str, Any]:
@@ -256,6 +259,86 @@ class AttestationValidatorTest(parameterized.TestCase):
     ):
       self.validator._enforce_policy(claims)
 
+  def test_enforce_policy_image_signatures_success(self):
+    """Tests that all required image signatures present in claims pass validation."""
+    policy = attestation_pb2.AttestationPolicy(
+        workload=attestation_pb2.WorkloadPolicy(
+            image_signatures=[
+                _FAKE_KEY_ID_1,
+                f"ECDSA_P256_SHA256:{_FAKE_KEY_ID_2}",
+            ]
+        )
+    )
+    self.validator._policy = policy
+    claims = _get_valid_claims()
+    claims["submods"]["container"]["image_signatures"] = [
+        {"key_id": _FAKE_KEY_ID_1, "signature_algorithm": "ECDSA_P256_SHA256"},
+        {"key_id": _FAKE_KEY_ID_2, "signature_algorithm": "ECDSA_P256_SHA256"},
+        {"key_id": _FAKE_KEY_ID_3, "signature_algorithm": "ECDSA_P256_SHA256"},
+    ]
+    self.validator._enforce_policy(claims)
+
+  @parameterized.named_parameters(
+      (
+          "missing_required_key_id",
+          [_FAKE_KEY_ID_1, _FAKE_KEY_ID_2],
+          [
+              {
+                  "key_id": _FAKE_KEY_ID_1,
+                  "signature_algorithm": "ECDSA_P256_SHA256",
+              },
+          ],
+          f"Missing required container image signature: {_FAKE_KEY_ID_2}",
+      ),
+      (
+          "algorithm_mismatch",
+          [f"ECDSA_P256_SHA256:{_FAKE_KEY_ID_1}"],
+          [
+              {
+                  "key_id": _FAKE_KEY_ID_1,
+                  "signature_algorithm": "RSASSA_PSS_SHA256",
+              },
+          ],
+          (
+              "Missing required container image signature:"
+              f" ECDSA_P256_SHA256:{_FAKE_KEY_ID_1}"
+          ),
+      ),
+      (
+          "missing_algorithm_in_claim_when_pinned",
+          [f"ECDSA_P256_SHA256:{_FAKE_KEY_ID_1}"],
+          [
+              {"key_id": _FAKE_KEY_ID_1},
+          ],
+          (
+              "Missing required container image signature:"
+              f" ECDSA_P256_SHA256:{_FAKE_KEY_ID_1}"
+          ),
+      ),
+      (
+          "empty_image_signatures_claim",
+          [_FAKE_KEY_ID_1],
+          [],
+          f"Missing required container image signature: {_FAKE_KEY_ID_1}",
+      ),
+  )
+  def test_enforce_policy_image_signatures_missing_or_mismatched_fails(
+      self, required_signatures, claim_signatures, expected_error
+  ):
+    """Tests that missing or algorithm-mismatched image signatures raise PolicyViolationError."""
+    self.validator._policy = attestation_pb2.AttestationPolicy(
+        workload=attestation_pb2.WorkloadPolicy(
+            image_signatures=required_signatures
+        )
+    )
+    claims = _get_valid_claims()
+    claims["submods"]["container"]["image_signatures"] = claim_signatures
+    with self.assertRaisesRegex(
+        exceptions.PolicyViolationError,
+        expected_error,
+    ):
+      self.validator._enforce_policy(claims)
+
   @parameterized.named_parameters(
       (
           "unknown_hw_model",
@@ -295,6 +378,36 @@ class AttestationValidatorTest(parameterized.TestCase):
           attestation_pb2.AttestationPolicy(
               workload=attestation_pb2.WorkloadPolicy(
                   signing_key_id=_FAKE_SIGNING_KEY
+              )
+          ),
+          {
+              "submods": {
+                  "container": {"image_signatures": [123]},
+                  "gce": {},
+              }
+          },
+          "Malformed image signatures claim.",
+      ),
+      (
+          "malformed_multi_image_signatures_type",
+          attestation_pb2.AttestationPolicy(
+              workload=attestation_pb2.WorkloadPolicy(
+                  image_signatures=[_FAKE_KEY_ID_1]
+              )
+          ),
+          {
+              "submods": {
+                  "container": {"image_signatures": "not_a_list"},
+                  "gce": {},
+              }
+          },
+          "Malformed image signatures claim.",
+      ),
+      (
+          "malformed_multi_image_signatures_element_type",
+          attestation_pb2.AttestationPolicy(
+              workload=attestation_pb2.WorkloadPolicy(
+                  image_signatures=[_FAKE_KEY_ID_1]
               )
           ),
           {
@@ -817,7 +930,6 @@ class AttestationValidatorTest(parameterized.TestCase):
       self.validator._verify_session_signature_mldsa(
           pub_key_proto, signature=_FAKE_PQC_SESSION_SIGNATURE, payload=payload
       )
-
 
   def test_verify_session_signature_mldsa_integration(self):
     """Tests ML-DSA signature verification using real Tink keysets without mocks."""
