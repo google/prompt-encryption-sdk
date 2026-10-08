@@ -418,6 +418,57 @@ class AttestationValidatorTest(parameterized.TestCase):
           },
           "Malformed image signatures claim.",
       ),
+      (
+          "malformed_confidential_space_submod",
+          attestation_pb2.AttestationPolicy(
+              confidential_space=attestation_pb2.ConfidentialSpacePolicy(
+                  support_attributes=["STABLE"]
+              )
+          ),
+          {
+              "swname": "CONFIDENTIAL_SPACE",
+              "submods": {
+                  "container": {},
+                  "gce": {},
+                  "confidential_space": "not_a_dict",
+              },
+          },
+          "Malformed token structure",
+      ),
+      (
+          "malformed_support_attributes_type",
+          attestation_pb2.AttestationPolicy(
+              confidential_space=attestation_pb2.ConfidentialSpacePolicy(
+                  support_attributes=["STABLE"]
+              )
+          ),
+          {
+              "swname": "CONFIDENTIAL_SPACE",
+              "submods": {
+                  "container": {},
+                  "gce": {},
+                  "confidential_space": {"support_attributes": "STABLE"},
+              },
+          },
+          "Malformed support_attributes claim.",
+      ),
+      (
+          "malformed_support_attributes_element_type",
+          attestation_pb2.AttestationPolicy(
+              confidential_space=attestation_pb2.ConfidentialSpacePolicy(
+                  support_attributes=["STABLE"]
+              )
+          ),
+          {
+              "swname": "CONFIDENTIAL_SPACE",
+              "submods": {
+                  "container": {},
+                  "gce": {},
+                  "confidential_space": {"support_attributes": [123]},
+              },
+          },
+          "Malformed support_attributes claim.",
+      ),
   )
   def test_enforce_policy_malformed_or_unsupported_fails(
       self, policy, claims, expected_error
@@ -428,6 +479,261 @@ class AttestationValidatorTest(parameterized.TestCase):
         exceptions.PolicyViolationError, expected_error
     ):
       self.validator._enforce_policy(claims)
+
+  def test_enforce_policy_confidential_space_success(self):
+    """Tests that ConfidentialSpacePolicy passes when all platform claims match."""
+    self.validator._policy = attestation_pb2.AttestationPolicy(
+        confidential_space=attestation_pb2.ConfidentialSpacePolicy(
+            require_debug_disabled=True,
+            require_secboot=True,
+            support_attributes=["STABLE", "LATEST"],
+        )
+    )
+    claims = _get_valid_claims()
+    claims["swname"] = "CONFIDENTIAL_SPACE"
+    claims["dbgstat"] = "disabled-since-boot"
+    claims["secboot"] = True
+    claims["submods"]["confidential_space"] = {
+        "support_attributes": ["STABLE", "LATEST", "USABLE"]
+    }
+    self.validator._enforce_policy(claims)
+
+  @parameterized.named_parameters(
+      (
+          "empty_policy_rejects_non_cs_swname",
+          attestation_pb2.ConfidentialSpacePolicy(),
+          {"swname": "GCE"},
+          "Software name mismatch. Expected 'CONFIDENTIAL_SPACE', got 'GCE'",
+      ),
+      (
+          "swname_mismatch",
+          attestation_pb2.ConfidentialSpacePolicy(require_debug_disabled=True),
+          {
+              "swname": "OTHER_OS",
+              "dbgstat": "disabled-since-boot",
+              "secboot": True,
+          },
+          (
+              "Software name mismatch. Expected 'CONFIDENTIAL_SPACE', got"
+              " 'OTHER_OS'"
+          ),
+      ),
+      (
+          "swname_missing",
+          attestation_pb2.ConfidentialSpacePolicy(require_secboot=True),
+          {"secboot": True},
+          "Software name mismatch. Expected 'CONFIDENTIAL_SPACE', got None",
+      ),
+      (
+          "dbgstat_enabled",
+          attestation_pb2.ConfidentialSpacePolicy(require_debug_disabled=True),
+          {
+              "swname": "CONFIDENTIAL_SPACE",
+              "dbgstat": "enabled",
+              "secboot": True,
+          },
+          (
+              "Debug status mismatch. Expected 'disabled-since-boot', got"
+              " 'enabled'"
+          ),
+      ),
+      (
+          "dbgstat_wrong_case",
+          attestation_pb2.ConfidentialSpacePolicy(require_debug_disabled=True),
+          {
+              "swname": "CONFIDENTIAL_SPACE",
+              "dbgstat": "Disabled-Since-Boot",
+              "secboot": True,
+          },
+          (
+              "Debug status mismatch. Expected 'disabled-since-boot', got"
+              " 'Disabled-Since-Boot'"
+          ),
+      ),
+      (
+          "dbgstat_non_string",
+          attestation_pb2.ConfidentialSpacePolicy(require_debug_disabled=True),
+          {
+              "swname": "CONFIDENTIAL_SPACE",
+              "dbgstat": False,
+              "secboot": True,
+          },
+          "Debug status mismatch. Expected 'disabled-since-boot', got False",
+      ),
+      (
+          "dbgstat_missing",
+          attestation_pb2.ConfidentialSpacePolicy(require_debug_disabled=True),
+          {"swname": "CONFIDENTIAL_SPACE", "secboot": True},
+          "Debug status mismatch. Expected 'disabled-since-boot', got None",
+      ),
+      (
+          "secboot_false",
+          attestation_pb2.ConfidentialSpacePolicy(require_secboot=True),
+          {"swname": "CONFIDENTIAL_SPACE", "secboot": False},
+          "Secure boot required, got False",
+      ),
+      (
+          "secboot_non_bool_truthy_string",
+          attestation_pb2.ConfidentialSpacePolicy(require_secboot=True),
+          {"swname": "CONFIDENTIAL_SPACE", "secboot": "true"},
+          "Secure boot required, got 'true'",
+      ),
+      (
+          "missing_confidential_space_submod_section",
+          attestation_pb2.ConfidentialSpacePolicy(
+              support_attributes=["STABLE"]
+          ),
+          {"swname": "CONFIDENTIAL_SPACE"},
+          (
+              r"Missing required Confidential Space support attribute:"
+              r" STABLE\. Found attributes: \[\]"
+          ),
+      ),
+      (
+          "missing_support_attribute",
+          attestation_pb2.ConfidentialSpacePolicy(
+              support_attributes=["STABLE"]
+          ),
+          {
+              "swname": "CONFIDENTIAL_SPACE",
+              "submods": {
+                  "confidential_space": {"support_attributes": ["USABLE"]}
+              },
+          },
+          "Missing required Confidential Space support attribute: STABLE",
+      ),
+  )
+  def test_enforce_policy_confidential_space_violation_fails(
+      self, cs_policy, claim_overrides, expected_error
+  ):
+    """Tests that ConfidentialSpacePolicy violations raise PolicyViolationError."""
+    self.validator._policy = attestation_pb2.AttestationPolicy(
+        confidential_space=cs_policy
+    )
+    claims = _get_valid_claims()
+    for key, val in claim_overrides.items():
+      if key == "submods":
+        claims["submods"].update(val)
+      else:
+        claims[key] = val
+    with self.assertRaisesRegex(
+        exceptions.PolicyViolationError, expected_error
+    ):
+      self.validator._enforce_policy(claims)
+
+  def test_validate_with_sanitized_confidential_space_token_claims(self):
+    """Tests end-to-end validate() against a sanitized GCA Confidential Space token payload."""
+    self.validator._policy = attestation_pb2.AttestationPolicy(
+        hw_model=attestation_pb2.HardwareModel.HARDWARE_MODEL_SEV,
+        workload=attestation_pb2.WorkloadPolicy(
+            image_hash=_FAKE_IMAGE_HASH,
+            signing_key_id=_FAKE_SIGNING_KEY,
+        ),
+        gce_instance=attestation_pb2.GceInstancePolicy(
+            project_id=_FAKE_PROJECT,
+            zone=_FAKE_ZONE,
+            instance_name=_FAKE_INSTANCE_NAME,
+            instance_id=_FAKE_INSTANCE_ID,
+        ),
+        confidential_space=attestation_pb2.ConfidentialSpacePolicy(
+            require_debug_disabled=True,
+            require_secboot=True,
+            support_attributes=["STABLE"],
+        ),
+    )
+    sanitized_gca_claims = {
+        "aud": "https://sts.google.com",
+        "dbgstat": "disabled-since-boot",
+        "eat_nonce": [
+            hashlib.sha256(_FAKE_PUB_KEY).hexdigest(),
+            hashlib.sha256(_FAKE_PQC_PUB_KEY).hexdigest(),
+            _FAKE_CHALLENGE_NONCE.hex(),
+        ],
+        "eat_profile": (
+            "https://cloud.google.com/confidential-computing/confidential-space/docs/reference/token-claims"
+        ),
+        "hwmodel": "GCP_AMD_SEV",
+        "iss": "https://confidentialcomputing.googleapis.com",
+        "secboot": True,
+        "submods": {
+            "confidential_space": {
+                "support_attributes": ["STABLE", "USABLE"],
+            },
+            "container": {
+                "cmd": [],
+                "env": {},
+                "image_digest": _FAKE_IMAGE_HASH,
+                "image_id": (
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                ),
+                "image_reference": (
+                    "us-docker.pkg.dev/example-project/repo/workload@sha256:abcdef"
+                ),
+                "image_signatures": [{
+                    "key_id": _FAKE_SIGNING_KEY,
+                    "signature": "MEUCIQ...",
+                    "signature_algorithm": "ECDSA_P256_SHA256",
+                }],
+                "restart_policy": "Never",
+            },
+            "gce": {
+                "instance_id": _FAKE_INSTANCE_ID,
+                "instance_name": _FAKE_INSTANCE_NAME,
+                "project_id": _FAKE_PROJECT,
+                "project_number": "123456789012",
+                "zone": _FAKE_ZONE,
+            },
+        },
+        "swname": "CONFIDENTIAL_SPACE",
+        "swversion": ["250200"],
+    }
+
+    mock_oidc = self.enter_context(
+        mock.patch.object(
+            validator.OIDCTokenValidator,
+            "validate_token",
+            return_value=sanitized_gca_claims,
+            autospec=True,
+        )
+    )
+    mock_verify_session_signature = self.enter_context(
+        mock.patch.object(
+            self.validator, "_verify_session_signature", autospec=True
+        )
+    )
+    mock_verify_pqc_signature = self.enter_context(
+        mock.patch.object(
+            self.validator, "_verify_session_signature_mldsa", autospec=True
+        )
+    )
+
+    response = attestation_pb2.AttestConnectionResponse(
+        instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+            key_bytes=_FAKE_PUB_KEY
+        ),
+        session_signature=_FAKE_SESSION_SIGNATURE,
+        pqc_public_key=attestation_pb2.MlDsaPublicKey(
+            serialized_public_keyset=_FAKE_PQC_PUB_KEY
+        ),
+        pqc_session_signature=_FAKE_PQC_SESSION_SIGNATURE,
+        evidence=[
+            attestation_pb2.AttestationEvidence(
+                verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+                gca_bundle=attestation_pb2.GcaTrustBundle(
+                    attestation_token="valid.jwt.payload"
+                ),
+            ),
+        ],
+    )
+
+    self.validator.validate(
+        response,
+        tls_ekm=b"fake_ekm_material",
+        expected_nonce=_FAKE_CHALLENGE_NONCE,
+    )
+    mock_oidc.assert_called_once()
+    mock_verify_session_signature.assert_called_once()
+    mock_verify_pqc_signature.assert_called_once()
 
   # --- 3. Main Validation Orchestration Tests ---
 

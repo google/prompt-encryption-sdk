@@ -113,6 +113,21 @@ message GceInstancePolicy {
   string instance_name = 4;
 }
 
+// Defines the expected Confidential Space platform properties.
+message ConfidentialSpacePolicy {
+  // When true, requires that the token's `dbgstat` claim equals
+  // "disabled-since-boot" (rejecting debug-enabled Confidential Space images).
+  bool require_debug_disabled = 1;
+
+  // When true, requires that the token's `secboot` claim is true.
+  bool require_secboot = 2;
+
+  // Required Confidential Space image support attributes (e.g., "STABLE",
+  // "LATEST", "USABLE"). Every attribute listed here must be present in the
+  // token's `submods.confidential_space.support_attributes` claim.
+  repeated string support_attributes = 3;
+}
+
 // AttestationPolicy defines the rules for validating an attestation report.
 message AttestationPolicy {
   // The required TEE hardware model, e.g., "TDX" or "SEV".
@@ -121,4 +136,6 @@ message AttestationPolicy {
   WorkloadPolicy workload = 2;
   // The policy describing the expected GCE instance properties.
   GceInstancePolicy gce_instance = 3;
+  // The policy describing the expected Confidential Space platform properties.
+  ConfidentialSpacePolicy confidential_space = 4;
 }

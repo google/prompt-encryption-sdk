@@ -47,6 +47,8 @@ _GCA_STRING_BY_HW_MODEL = types.MappingProxyType({
     attestation_pb2.HARDWARE_MODEL_SEV_SNP: "GCP_AMD_SEV_SNP",
 })
 _GCE_POLICY_FIELDS = ("project_id", "zone", "instance_id", "instance_name")
+_EXPECTED_CS_SWNAME = "CONFIDENTIAL_SPACE"
+_EXPECTED_CS_DBGSTAT = "disabled-since-boot"
 
 
 def _safe_get_map(data: Any, key: str) -> Mapping[str, Any]:
@@ -97,6 +99,83 @@ def _parse_image_signatures(
         token_exact_signatures.add(f"{sig_alg}:{key_id}")
 
   return token_key_ids, token_exact_signatures
+
+
+def _parse_support_attributes(
+    cs_claims: Mapping[str, Any],
+) -> set[str]:
+  """Extracts support attributes from `submods.confidential_space` claims.
+
+  Args:
+      cs_claims: The `submods.confidential_space` claims mapping from the token.
+
+  Returns:
+      A set of support attribute strings present in the token.
+
+  Raises:
+      PolicyViolationError: If `support_attributes` is not a list of strings.
+  """
+  attrs = cs_claims.get("support_attributes", [])
+  if not isinstance(attrs, list) or not all(
+      isinstance(attr, str) for attr in attrs
+  ):
+    raise exceptions.PolicyViolationError("Malformed support_attributes claim.")
+  return set(attrs)
+
+
+def _validate_confidential_space_policy(
+    claims: Mapping[str, Any],
+    submods: Mapping[str, Any],
+    cs_policy: attestation_pb2.ConfidentialSpacePolicy,
+) -> None:
+  """Validates Confidential Space platform claims against `cs_policy`.
+
+  Args:
+      claims: The decoded top-level OIDC token claims.
+      submods: The `submods` claims mapping from the token.
+      cs_policy: The configured ConfidentialSpacePolicy.
+
+  Raises:
+      PolicyViolationError: If any required Confidential Space platform claim
+        is missing or mismatched.
+  """
+  token_swname = claims.get("swname")
+  if token_swname != _EXPECTED_CS_SWNAME:
+    raise exceptions.PolicyViolationError(
+        f"Software name mismatch. Expected {_EXPECTED_CS_SWNAME!r}, got"
+        f" {token_swname!r}"
+    )
+
+  if cs_policy.require_debug_disabled:
+    token_dbgstat = claims.get("dbgstat")
+    if token_dbgstat != _EXPECTED_CS_DBGSTAT:
+      raise exceptions.PolicyViolationError(
+          f"Debug status mismatch. Expected {_EXPECTED_CS_DBGSTAT!r}, got"
+          f" {token_dbgstat!r}"
+      )
+
+  if cs_policy.require_secboot:
+    token_secboot = claims.get("secboot")
+    if not isinstance(token_secboot, bool) or not token_secboot:
+      raise exceptions.PolicyViolationError(
+          f"Secure boot required, got {token_secboot!r}"
+      )
+
+  if cs_policy.support_attributes:
+    try:
+      cs_claims = _safe_get_map(submods, "confidential_space")
+    except exceptions.AttestationVerificationError as e:
+      raise exceptions.PolicyViolationError(
+          f"Malformed token structure: {e}"
+      ) from e
+    token_support_attrs = _parse_support_attributes(cs_claims)
+    for required_attr in cs_policy.support_attributes:
+      if required_attr not in token_support_attrs:
+        raise exceptions.PolicyViolationError(
+            "Missing required Confidential Space support attribute:"
+            f" {required_attr}. Found attributes:"
+            f" {sorted(token_support_attrs)}"
+        )
 
 
 class OIDCTokenValidator:
@@ -390,6 +469,12 @@ class AttestationValidator:
               f"GCE Instance {field_name} mismatch. "
               f"Expected {expected_value}, got {actual_value}"
           )
+
+    # 4. Confidential Space Platform Policy Validation
+    if self._policy.HasField("confidential_space"):
+      _validate_confidential_space_policy(
+          claims, submods, self._policy.confidential_space
+      )
 
   def _verify_instance_key_binding(
       self,
