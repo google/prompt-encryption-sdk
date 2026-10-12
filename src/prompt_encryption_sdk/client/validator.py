@@ -211,11 +211,17 @@ class OIDCTokenValidator:
     ssl_context = ssl.create_default_context(cafile=requests.certs.where())
     self._jwks_client = jwt.PyJWKClient(jwks_uri, ssl_context=ssl_context)
 
-  def validate_token(self, token: str) -> dict[str, Any]:
+  def validate_token(
+      self,
+      token: str,
+      *,
+      expected_audience: str = constants.DEFAULT_AUDIENCE,
+  ) -> dict[str, Any]:
     """Decodes and validates the OIDC token signature and standard claims.
 
     Args:
         token: The raw JWT string.
+        expected_audience: The expected audience (`aud` claim) of the token.
 
     Returns:
         The decoded claims dictionary.
@@ -231,7 +237,7 @@ class OIDCTokenValidator:
       verifier = public_keyset_handle.primitive(tink_jwt.JwtPublicKeyVerify)
       validator = tink_jwt.new_validator(
           expected_issuer=self._issuer,
-          expected_audience=constants.DEFAULT_AUDIENCE,
+          expected_audience=expected_audience,
           expected_type_header="JWT",
       )
       result = verifier.verify_and_decode(token, validator)
@@ -260,6 +266,15 @@ class AttestationValidator:
     """Closes resources held by the validator."""
     if self._owns_oidc_validator:
       self._oidc_validator.close()
+
+  def _validate_oidc_token(self, attestation_token: str) -> dict[str, Any]:
+    """Validates the OIDC token signature and expected audience claim."""
+    if self._policy.expected_audience:
+      return self._oidc_validator.validate_token(
+          attestation_token,
+          expected_audience=self._policy.expected_audience,
+      )
+    return self._oidc_validator.validate_token(attestation_token)
 
   def validate(
       self,
@@ -305,7 +320,7 @@ class AttestationValidator:
       )
 
     # 2. Verify OIDC Token Signature (GCA Validation)
-    claims = self._oidc_validator.validate_token(gca_bundle.attestation_token)
+    claims = self._validate_oidc_token(gca_bundle.attestation_token)
 
     # 3. Policy Enforcement (Workload, Image, Project)
     self._enforce_policy(claims)

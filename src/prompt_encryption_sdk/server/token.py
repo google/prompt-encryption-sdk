@@ -36,6 +36,7 @@ import tink
 TEE_SERVER_SOCKET_PATH = "/run/container_launcher/teeserver.sock"
 TOKEN_ENDPOINT = "/v1/token"
 DEFAULT_AUDIENCE = "https://sts.google.com"
+MAX_AUDIENCE_BYTES = 512
 TOKEN_TYPE = "OIDC"
 DEFAULT_REFRESH_MULTIPLIER = 0.9
 DEFAULT_RETRY_INTERVAL_SECONDS = 10
@@ -131,13 +132,19 @@ class TokenManager:
       self,
       *,
       key_manager: keys.KeyManager,
+      audience: str = DEFAULT_AUDIENCE,
       jitter_window_seconds: float = 60.0,
       rng: random.Random | None = None,
       attestation_token_path: pathlib.Path = pathlib.Path(
           "attestation_token.txt"
       ),
   ):
+    if not audience or len(audience.encode("utf-8")) > MAX_AUDIENCE_BYTES:
+      raise ValueError(
+          f"audience must be non-empty and at most {MAX_AUDIENCE_BYTES} bytes."
+      )
     self.key_manager = key_manager
+    self.audience = audience
     self.attestation_token_path = attestation_token_path
     self.jitter_window_seconds = jitter_window_seconds
     self.rng = rng if rng is not None else random.Random()
@@ -153,20 +160,21 @@ class TokenManager:
     )
 
   @staticmethod
-  def _fetch_attestation_token(fingerprints: Sequence[str]) -> bytes:
+  def _fetch_attestation_token(
+      fingerprints: Sequence[str],
+      audience: str = DEFAULT_AUDIENCE,
+  ) -> bytes:
     """Attempts to fetch attestation token based on configured attestation type."""
     attestation_type = os.environ.get("ATTESTATION_TYPE", "uds").lower()
 
     if attestation_type == "uds":
       return get_cs_token_bytes(
-          audience=DEFAULT_AUDIENCE,
+          audience=audience,
           token_type=TOKEN_TYPE,
           nonces=list(fingerprints),
       )
     elif attestation_type == "gotpm":
-      return get_cvm_token_bytes(
-          audience=DEFAULT_AUDIENCE, nonces=list(fingerprints)
-      )
+      return get_cvm_token_bytes(audience=audience, nonces=list(fingerprints))
     else:
       raise ValueError(f"Unknown ATTESTATION_TYPE {attestation_type!r}.")
 
@@ -182,7 +190,8 @@ class TokenManager:
       pqc_fingerprint = keys.calculate_fingerprint(pqc_pub)
 
       attestation_token = self._fetch_attestation_token(
-          [ecdsa_fingerprint, pqc_fingerprint]
+          [ecdsa_fingerprint, pqc_fingerprint],
+          audience=self.audience,
       )
       common.write_file(self.attestation_token_path, attestation_token, 0o644)
     logging.info("Refresh complete.")

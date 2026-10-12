@@ -320,6 +320,96 @@ class TokenManagerTest(parameterized.TestCase):
     snapshot = token_manager.get_identity_snapshot()
     self.assertEqual(snapshot, (ecdsa_pub, pqc_pub, attestation_token))
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="uds_backend",
+          env_vars={"ATTESTATION_TYPE": "uds"},
+          expect_cs_call=True,
+      ),
+      dict(
+          testcase_name="gotpm_backend",
+          env_vars={"ATTESTATION_TYPE": "gotpm"},
+          expect_cs_call=False,
+      ),
+  )
+  @mock.patch.object(token, "get_cvm_token_bytes", autospec=True)
+  @mock.patch.object(token, "get_cs_token_bytes", autospec=True)
+  def test_refresh_custom_audience(
+      self,
+      mock_get_cs_token_bytes,
+      mock_get_cvm_token_bytes,
+      env_vars,
+      expect_cs_call,
+  ):
+    with mock.patch.dict(os.environ, env_vars, clear=True):
+      ecdsa_pub = b"test_ecdsa_public_key"
+      pqc_pub = b"test_pqc_public_keyset"
+      expected_nonces = [
+          hashlib.sha256(ecdsa_pub).hexdigest(),
+          hashlib.sha256(pqc_pub).hexdigest(),
+      ]
+      self.mock_key_manager.get_current_public_key.return_value = ecdsa_pub
+      self.mock_key_manager.get_current_pqc_public_key.return_value = pqc_pub
+      mock_get_cs_token_bytes.return_value = b"custom_cs_token"
+      mock_get_cvm_token_bytes.return_value = b"custom_cvm_token"
+
+      token_manager = token.TokenManager(
+          key_manager=self.mock_key_manager,
+          audience="custom-tee-audience",
+          attestation_token_path=self.attestation_token_path,
+          rng=self.seeded_rng,
+      )
+      token_manager.refresh()
+
+      if expect_cs_call:
+        mock_get_cs_token_bytes.assert_called_once_with(
+            audience="custom-tee-audience",
+            token_type="OIDC",
+            nonces=expected_nonces,
+        )
+        mock_get_cvm_token_bytes.assert_not_called()
+        self.assertEqual(
+            self.attestation_token_path.read_bytes(), b"custom_cs_token"
+        )
+      else:
+        mock_get_cvm_token_bytes.assert_called_once_with(
+            audience="custom-tee-audience",
+            nonces=expected_nonces,
+        )
+        mock_get_cs_token_bytes.assert_not_called()
+        self.assertEqual(
+            self.attestation_token_path.read_bytes(), b"custom_cvm_token"
+        )
+
+  def test_init_max_length_audience_succeeds(self):
+    max_audience = "a" * token.MAX_AUDIENCE_BYTES
+    token_manager = token.TokenManager(
+        key_manager=self.mock_key_manager,
+        audience=max_audience,
+    )
+    self.assertEqual(token_manager.audience, max_audience)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="empty_audience",
+          audience="",
+      ),
+      dict(
+          testcase_name="exceeds_max_ascii_bytes",
+          audience="a" * (token.MAX_AUDIENCE_BYTES + 1),
+      ),
+      dict(
+          testcase_name="exceeds_max_utf8_bytes",
+          audience="€" * 171,
+      ),
+  )
+  def test_init_invalid_audience_raises_value_error(self, audience):
+    with self.assertRaisesRegex(ValueError, "audience must be non-empty"):
+      token.TokenManager(
+          key_manager=self.mock_key_manager,
+          audience=audience,
+      )
+
 
 if __name__ == "__main__":
   absltest.main()

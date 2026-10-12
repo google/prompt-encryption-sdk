@@ -138,4 +138,7 @@ message AttestationPolicy {
   GceInstancePolicy gce_instance = 3;
   // The policy describing the expected Confidential Space platform properties.
   ConfidentialSpacePolicy confidential_space = 4;
+  // Optional expected OIDC token audience (`aud` claim). When unset, defaults
+  // to the SDK's standard audience.
+  string expected_audience = 5;
 }

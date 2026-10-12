@@ -14,6 +14,7 @@
 
 """Tests for the AttestationValidator and OIDCTokenValidator classes."""
 
+import datetime
 import hashlib
 import json
 from typing import Any
@@ -1262,6 +1263,60 @@ class AttestationValidatorTest(parameterized.TestCase):
         pub_key_proto, signature=signature_bytes, payload=payload
     )
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="unset_expected_audience",
+          policy=attestation_pb2.AttestationPolicy(),
+          expected_kwargs={},
+      ),
+      dict(
+          testcase_name="custom_expected_audience",
+          policy=attestation_pb2.AttestationPolicy(
+              expected_audience="custom-tee-audience"
+          ),
+          expected_kwargs={"expected_audience": "custom-tee-audience"},
+      ),
+  )
+  def test_validate_policy_expected_audience(self, policy, expected_kwargs):
+    """Tests that AttestationValidator forwards policy.expected_audience to OIDCTokenValidator."""
+    mock_oidc_validator = mock.create_autospec(validator.OIDCTokenValidator)
+    mock_oidc_validator.validate_token.return_value = _get_valid_claims()
+    av = validator.AttestationValidator(
+        policy,
+        oidc_validator=mock_oidc_validator,
+    )
+    self.enter_context(
+        mock.patch.object(av, "_verify_session_signature", autospec=True)
+    )
+    self.enter_context(
+        mock.patch.object(av, "_verify_session_signature_mldsa", autospec=True)
+    )
+
+    response = attestation_pb2.AttestConnectionResponse(
+        instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+            key_bytes=_FAKE_PUB_KEY
+        ),
+        session_signature=_FAKE_SESSION_SIGNATURE,
+        pqc_public_key=attestation_pb2.MlDsaPublicKey(
+            serialized_public_keyset=_FAKE_PQC_PUB_KEY
+        ),
+        pqc_session_signature=_FAKE_PQC_SESSION_SIGNATURE,
+        evidence=[
+            attestation_pb2.AttestationEvidence(
+                verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+                gca_bundle=attestation_pb2.GcaTrustBundle(
+                    attestation_token="valid.jwt.payload"
+                ),
+            ),
+        ],
+    )
+
+    av.validate(response, tls_ekm=b"fake_ekm_material")
+    mock_oidc_validator.validate_token.assert_called_once_with(
+        "valid.jwt.payload",
+        **expected_kwargs,
+    )
+
 
 class OIDCTokenValidatorTest(parameterized.TestCase):
 
@@ -1364,6 +1419,80 @@ class OIDCTokenValidatorTest(parameterized.TestCase):
     oidc_validator = validator.OIDCTokenValidator(session=mock_session)
     oidc_validator.close()
     mock_session.close.assert_called_once()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="default_audience_accepted",
+          token_audience=constants.DEFAULT_AUDIENCE,
+          validate_kwargs={},
+          should_succeed=True,
+      ),
+      dict(
+          testcase_name="custom_audience_accepted",
+          token_audience="custom-tee-audience",
+          validate_kwargs={"expected_audience": "custom-tee-audience"},
+          should_succeed=True,
+      ),
+      dict(
+          testcase_name="custom_audience_mismatch_rejected",
+          token_audience=constants.DEFAULT_AUDIENCE,
+          validate_kwargs={"expected_audience": "custom-tee-audience"},
+          should_succeed=False,
+      ),
+      dict(
+          testcase_name="default_audience_rejects_custom_token",
+          token_audience="custom-tee-audience",
+          validate_kwargs={},
+          should_succeed=False,
+      ),
+  )
+  def test_validate_token_audience_enforcement(
+      self,
+      token_audience,
+      validate_kwargs,
+      should_succeed,
+  ):
+    """Tests cryptographic Tink JWT validation across default, custom, and mismatched audiences."""
+    private_handle = tink.new_keyset_handle(
+        tink_jwt.jwt_rs256_2048_f4_template()
+    )
+    public_handle = private_handle.public_keyset_handle()
+    jwk_set_dict = json.loads(
+        tink_jwt.jwk_set_from_public_keyset_handle(public_handle)
+    )
+
+    self.mock_get.return_value.status_code = 200
+    self.mock_get.return_value.json.return_value = {
+        "issuer": "http://test-issuer",
+        "jwks_uri": "http://test-jwks-uri",
+    }
+    mock_jwk_client = self.enter_context(
+        mock.patch.object(jwt, "PyJWKClient", autospec=True)
+    )
+    mock_jwk_client.return_value.fetch_data.return_value = jwk_set_dict
+
+    signer = private_handle.primitive(tink_jwt.JwtPublicKeySign)
+    raw_jwt = tink_jwt.new_raw_jwt(
+        type_header="JWT",
+        issuer="http://test-issuer",
+        audiences=[token_audience],
+        expiration=datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(minutes=5),
+        custom_claims={"claim": "value"},
+    )
+    signed_token = signer.sign_and_encode(raw_jwt)
+
+    oidc_validator = validator.OIDCTokenValidator()
+    if should_succeed:
+      claims = oidc_validator.validate_token(signed_token, **validate_kwargs)
+      self.assertEqual(claims["claim"], "value")
+      self.assertEqual(claims["aud"], [token_audience])
+    else:
+      with self.assertRaisesRegex(
+          exceptions.AttestationVerificationError,
+          "OIDC Token validation failed",
+      ):
+        oidc_validator.validate_token(signed_token, **validate_kwargs)
 
 
 if __name__ == "__main__":
