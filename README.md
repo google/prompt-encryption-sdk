@@ -9,6 +9,7 @@ This SDK is particularly useful for protecting sensitive data, ensuring that pro
 - **End-to-End Encryption**: Encrypts data in transit directly into the secure enclave, protecting it from intermediate infrastructure.
 - **Attested TLS**: Seamlessly ties Google Cloud Confidential Space attestation into the TLS handshake.
 - **Client & Server Support**: High-level primitives to build attested clients and compliant ASGI/WSGI servers.
+- **Language-Neutral Client Core**: Kotlin, Swift, Go, Python, and other clients can use their normal HTTP libraries through one loopback-only attested client executable. See [clientcore/README.md](clientcore/README.md).
 
 ## Prerequisites
 
