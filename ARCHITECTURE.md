@@ -141,6 +141,15 @@ By verifying this entire chain (Hardware $$\rightarrow$$ Token $$\rightarrow$$ I
 
 ---
 
+## Mutual Attestation
+When the client also runs inside a TEE, the same single `/_attest-connection` round trip can verify both directions: the client's proof travels in the request, the server verifies it before producing its own, and the server's proof travels back in the response.
+
+That exchange drops the client and server nonces entirely and uses the TLS Exported Keying Material as the challenge — the EKM is already derived from both peers' handshake randoms, so it is unique and unforgeable per session. The consequence is that the binding is constant for the session's lifetime, so a mutually attested session is attested exactly once and is never revalidated; re-attestation means opening a new connection.
+
+See [Mutual Attestation](MUTUAL_ATTESTATION.md) for the protocol, the role/mode domain separation that replaces the nonces, and the API.
+
+---
+
 ## Threat Model Matrix & Security Considerations
 ### What the SDK Protects Against
 | Threat | Protected? | Mechanism |

@@ -22,6 +22,7 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from prompt_encryption_sdk import attestation as attestation_protocol
 from prompt_encryption_sdk.proto import attestation_pb2
 from prompt_encryption_sdk.server import asgi
 from prompt_encryption_sdk.server import attestation
@@ -175,6 +176,61 @@ class MiddlewareTest(parameterized.TestCase):
           response_dict,
       )
       self.assertIn(self.ssl_obj, self.mw._attested_sockets)
+
+    asyncio.run(run())
+
+  def test_replayed_attestation_drops_the_connection(self):
+    """A mutually attested session may not attest again; it is dropped."""
+
+    async def run():
+      self.mw._attested_sockets.add(self.ssl_obj)
+      self.mock_attested_tls.attest_connection.side_effect = (
+          attestation_protocol.AttestationReplayError("already attested")
+      )
+      scope = {
+          "type": "http",
+          "path": "/_attest-connection",
+          "method": "POST",
+          "headers": [],
+          "extensions": {"tls_socket": self.ssl_obj},
+      }
+
+      async def receive():
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+      await self.mw(scope, receive, self.send)
+
+      (response_start_arg,) = self.send.call_args_list[0].args
+      with self.subTest("Forbidden"):
+        self.assertEqual(
+            response_start_arg["status"], http.HTTPStatus.FORBIDDEN
+        )
+      with self.subTest("ConnectionClosed"):
+        self.assertIn(
+            (b"connection", b"close"), response_start_arg["headers"]
+        )
+      with self.subTest("AuthorizationRevoked"):
+        self.assertNotIn(self.ssl_obj, self.mw._attested_sockets)
+
+      # Application traffic on the dropped session is refused.
+      self.send.reset_mock()
+      await self.mw(
+          {
+              "type": "http",
+              "path": "/infer",
+              "method": "GET",
+              "headers": [],
+              "extensions": {"tls_socket": self.ssl_obj},
+          },
+          receive,
+          self.send,
+      )
+      (unauthorized_start,) = self.send.call_args_list[0].args
+      with self.subTest("SubsequentTrafficUnauthorized"):
+        self.assertEqual(
+            unauthorized_start["status"], http.HTTPStatus.UNAUTHORIZED
+        )
+        self.app.assert_not_called()
 
     asyncio.run(run())
 
@@ -361,7 +417,9 @@ class MiddlewareTest(parameterized.TestCase):
     )
     mock_token_manager_cls.return_value.__enter__.assert_called_once()
     mock_attested_tls_cls.assert_called_once_with(
-        mock_token_manager_cls.return_value
+        mock_token_manager_cls.return_value,
+        client_policy=None,
+        require_mutual_attestation=False,
     )
     mock_uvicorn_run.assert_called_once()
     self.assertIsInstance(
@@ -397,7 +455,11 @@ class MiddlewareTest(parameterized.TestCase):
     )
 
     mock_token_manager.__enter__.assert_called_once()
-    mock_attested_tls_cls.assert_called_once_with(mock_token_manager)
+    mock_attested_tls_cls.assert_called_once_with(
+        mock_token_manager,
+        client_policy=None,
+        require_mutual_attestation=False,
+    )
     mock_uvicorn_run.assert_called_once()
     self.assertIsInstance(
         mock_uvicorn_run.call_args[0][0], asgi.PromptEncryptionASGIMiddleware
@@ -433,7 +495,9 @@ class MiddlewareTest(parameterized.TestCase):
     )
     mock_token_manager_cls.return_value.__enter__.assert_called_once()
     mock_attested_tls_cls.assert_called_once_with(
-        mock_token_manager_cls.return_value
+        mock_token_manager_cls.return_value,
+        client_policy=None,
+        require_mutual_attestation=False,
     )
     mock_uvicorn_run.assert_called_once()
     self.assertIsInstance(

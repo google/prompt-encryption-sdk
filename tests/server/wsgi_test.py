@@ -21,6 +21,7 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from prompt_encryption_sdk import attestation as attestation_protocol
 from prompt_encryption_sdk.proto import attestation_pb2
 from prompt_encryption_sdk.server import attestation
 from prompt_encryption_sdk.server import keys
@@ -130,6 +131,44 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
         self.mw._attested_sockets,
     )
 
+  def test_replayed_attestation_drops_the_connection(self):
+    """A mutually attested session may not attest again; it is dropped."""
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    self.mw._attested_sockets.add(mock_socket)
+    self.mock_attested_tls.attest_connection.side_effect = (
+        attestation_protocol.AttestationReplayError("already attested")
+    )
+
+    response = self.client.post(
+        "/_attest-connection",
+        json={},
+        environ_overrides={"prompt_encryption.socket": mock_socket},
+    )
+
+    with self.subTest("Forbidden"):
+      self.assertEqual(response.status_code, http.HTTPStatus.FORBIDDEN)
+      self.assertIn(b"already attested", response.data)
+    with self.subTest("ConnectionClosed"):
+      self.assertEqual(response.headers.get("Connection"), "close")
+    with self.subTest("AuthorizationRevoked"):
+      self.assertNotIn(mock_socket, self.mw._attested_sockets)
+
+  def test_application_traffic_is_refused_after_a_replay_drop(self):
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    self.mw._attested_sockets.add(mock_socket)
+    self.mock_attested_tls.attest_connection.side_effect = (
+        attestation_protocol.AttestationReplayError("already attested")
+    )
+    environ_overrides = {"prompt_encryption.socket": mock_socket}
+    self.client.post(
+        "/_attest-connection", json={}, environ_overrides=environ_overrides
+    )
+
+    response = self.client.get("/infer", environ_overrides=environ_overrides)
+
+    self.assertEqual(response.status_code, http.HTTPStatus.UNAUTHORIZED)
+    self.app.assert_not_called()
+
   @parameterized.named_parameters(
       dict(
           testcase_name="missing_socket",
@@ -207,7 +246,11 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
     )
 
     with self.subTest("AttestedTLS"):
-      mock_attested_tls_cls.assert_called_once_with(mock_token_manager)
+      mock_attested_tls_cls.assert_called_once_with(
+          mock_token_manager,
+          client_policy=None,
+          require_mutual_attestation=False,
+      )
 
     with self.subTest("StandaloneApplication"):
       mock_standalone_app_cls.assert_called_once_with(

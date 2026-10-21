@@ -9,6 +9,7 @@ This SDK is particularly useful for protecting sensitive data, ensuring that pro
 - **End-to-End Encryption**: Encrypts data in transit directly into the secure enclave, protecting it from intermediate infrastructure.
 - **Attested TLS**: Seamlessly ties Google Cloud Confidential Space attestation into the TLS handshake.
 - **Client & Server Support**: High-level primitives to build attested clients and compliant ASGI/WSGI servers.
+- **Mutual Attestation**: When the client also runs in a TEE, both peers can verify each other in a single round trip. See [Mutual Attestation](MUTUAL_ATTESTATION.md).
 
 ## Prerequisites
 
@@ -16,7 +17,7 @@ This SDK is particularly useful for protecting sensitive data, ensuring that pro
 - OpenSSL (for generating certificates if running a local test server)
 - A Google Cloud Project with Confidential Space enabled (for production server deployments)
 
-For more technical details on how the SDK works, see the [Architecture Documentation](ARCHITECTURE.md).
+For more technical details on how the SDK works, see the [Architecture Documentation](ARCHITECTURE.md). For the client-verifies-server-and-server-verifies-client flow, see [Mutual Attestation](MUTUAL_ATTESTATION.md).
 
 ## Installation
 
