@@ -21,12 +21,14 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from prompt_encryption_sdk import attestation as attestation_protocol
 from prompt_encryption_sdk.client import connection
 from prompt_encryption_sdk.client import constants
 from prompt_encryption_sdk.client import exceptions
 from prompt_encryption_sdk.client import validator
 from prompt_encryption_sdk.ekm import exporter as ekm_exporter
 from prompt_encryption_sdk.proto import attestation_pb2
+from google.protobuf import json_format
 import urllib3
 from urllib3.connection import HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool
@@ -367,6 +369,148 @@ class AttestedPoolManagerTest(absltest.TestCase):
     # Should NOT be Attested pool
     self.assertNotIsInstance(pool, connection.AttestedHTTPSConnectionPool)
     self.assertIsInstance(pool, HTTPConnectionPool)
+
+
+class MutualAttestedHTTPSConnectionTest(parameterized.TestCase):
+  """Covers the client half of the single-round-trip mutual exchange."""
+
+  def setUp(self):
+    super().setUp()
+    self.prover = mock.MagicMock()
+    self.client_proof = attestation_pb2.AttestationProof(
+        session_signature=b"client-sig"
+    )
+    self.prover.create_proof.return_value = self.client_proof
+
+    self.validator_cls = mock.MagicMock()
+    self.validator_inst = self.validator_cls.return_value
+
+    self.export_ekm = mock.MagicMock(return_value=b"session-ekm")
+
+    self.conn = connection.AttestedHTTPSConnection(
+        host="example.com",
+        port=443,
+        policy=attestation_pb2.AttestationPolicy(),
+        mutual_attestation=True,
+        attestation_prover=self.prover,
+        ekm_exporter_fn=self.export_ekm,
+        attestation_validator_cls=self.validator_cls,
+    )
+
+  def _stub_response(self, response: attestation_pb2.AttestConnectionResponse):
+    mock_response = mock.create_autospec(urllib3.HTTPResponse, instance=True)
+    mock_response.status = 200
+    mock_response.headers = {"Content-Type": "application/x-protobuf"}
+    mock_response.data = response.SerializeToString()
+    self.conn.getresponse = mock.MagicMock(return_value=mock_response)
+    return mock_response
+
+  def _mutual_response(self, **overrides):
+    fields = dict(
+        protocol_version=(
+            attestation_protocol.MUTUAL_ATTESTATION_PROTOCOL_VERSION
+        ),
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        mutual_attestation_complete=True,
+    )
+    fields.update(overrides)
+    return attestation_pb2.AttestConnectionResponse(**fields)
+
+  def test_requires_a_prover_when_mutual_attestation_is_enabled(self):
+    with self.assertRaisesRegex(ValueError, "attestation_prover is required"):
+      connection.AttestedHTTPSConnection(
+          host="example.com", port=443, mutual_attestation=True
+      )
+
+  @mock.patch.object(HTTPSConnection, "request", autospec=True)
+  def test_one_round_trip_carries_the_client_proof(self, mock_super_request):
+    self._stub_response(self._mutual_response())
+
+    self.conn._perform_attestation_handshake()
+
+    with self.subTest("EkmExportedWithoutContext"):
+      self.export_ekm.assert_called_once_with(
+          self.conn.sock, constants.EKM_LENGTH, constants.EKM_LABEL
+      )
+    with self.subTest("ClientProvesItselfAsTheClientRole"):
+      self.prover.create_proof.assert_called_once_with(
+          b"session-ekm",
+          peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+          mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+      )
+    with self.subTest("ExactlyOneFlight"):
+      mock_super_request.assert_called_once()
+    with self.subTest("RequestCarriesTheProofAndNoNonce"):
+      sent = json_format.Parse(
+          mock_super_request.call_args.kwargs["body"],
+          attestation_pb2.AttestConnectionRequest(),
+      )
+      self.assertEqual(sent.client_attestation, self.client_proof)
+      self.assertEqual(sent.mode, attestation_pb2.ATTESTATION_MODE_MUTUAL)
+      self.assertEqual(sent.protocol_version, 1)
+      self.assertEmpty(sent.nonce)
+    with self.subTest("ServerProofValidatedAgainstTheSameEkm"):
+      self.validator_inst.validate.assert_called_once_with(
+          mock.ANY,
+          b"session-ekm",
+          peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_SERVER,
+          mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+      )
+    with self.subTest("ValidatorResourcesReleased"):
+      self.validator_inst.close.assert_called_once()
+
+  @parameterized.named_parameters(
+      ("server_only_mode", {"mode": attestation_pb2.ATTESTATION_MODE_SERVER_ONLY}),
+      ("wrong_protocol_version", {"protocol_version": 2}),
+      ("not_complete", {"mutual_attestation_complete": False}),
+  )
+  @mock.patch.object(HTTPSConnection, "request", autospec=True)
+  def test_downgrade_is_refused(self, overrides, mock_super_request):
+    del mock_super_request
+    self._stub_response(self._mutual_response(**overrides))
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationHandshakeError, "refusing server-only downgrade"
+    ):
+      self.conn._perform_attestation_handshake()
+
+    self.validator_inst.validate.assert_not_called()
+
+  @mock.patch.object(HTTPSConnection, "request", autospec=True)
+  def test_invalid_server_proof_propagates(self, mock_super_request):
+    del mock_super_request
+    self._stub_response(self._mutual_response())
+    self.validator_inst.validate.side_effect = (
+        exceptions.AttestationVerificationError("bad server proof")
+    )
+
+    with self.assertRaises(exceptions.AttestationVerificationError):
+      self.conn._perform_attestation_handshake()
+
+  def test_mutual_sessions_are_never_revalidated(self):
+    self.conn.is_attested = True
+    self.conn._last_attestation_time = time.time() - 10_000
+
+    self.assertFalse(self.conn._should_revalidate())
+
+  @mock.patch.object(HTTPSConnection, "request", autospec=True)
+  def test_request_does_not_revalidate_a_mutual_session(
+      self, mock_super_request
+  ):
+    self.conn.is_attested = True
+    self.conn._last_attestation_time = time.time() - 10_000
+
+    with mock.patch.object(self.conn, "revalidate_session") as mock_reval:
+      self.conn.request("GET", "/infer")
+
+    mock_reval.assert_not_called()
+    mock_super_request.assert_called_once()
+
+  def test_explicit_revalidation_is_refused(self):
+    with self.assertRaisesRegex(
+        exceptions.PromptEncryptionError, "cannot be revalidated"
+    ):
+      self.conn.revalidate_session()
 
 
 if __name__ == "__main__":
