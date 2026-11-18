@@ -130,40 +130,8 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
 
   def _perform_attestation_handshake(self) -> None:
     """Executes the attestation protocol (Request -> Response -> Validate)."""
-
-    # A. Generate a fresh nonce
-    nonce = secrets.token_bytes(constants.NONCE_LENGTH)
-
-    attestation_req = attestation_pb2.AttestConnectionRequest(
-        required_verifier_type=[attestation_pb2.VerifierType.VERIFIER_TYPE_GCA],
-        nonce=nonce,
-    )
-    json_body = json_format.MessageToJson(attestation_req)
-    # B. Send Request
     try:
-      # Note: We call the superclass's `request` method explicitly here to
-      # avoid a recursive loop during the handshake.
-      # Using HTTPConnection request method to send raw bytes.
-      super().request(
-          "POST",
-          constants.ATTESTATION_ENDPOINT,
-          body=json_body,
-          headers={
-              "Content-Type": "application/json",
-              "Accept": "application/json, application/x-protobuf",
-          },
-      )
-      response = self.getresponse()
-      attest_resp = self._process_attestation_response(response)
-
-      # D. Export Keying Material
-      tls_ekm = self._ekm_exporter_fn(
-          self.sock, constants.EKM_LENGTH, constants.EKM_LABEL, context=nonce  # pyrefly: ignore[bad-argument-type]
-      )
-
-      # E. Validate
-      att_validator = self._attestation_validator_cls(self._policy)
-      att_validator.validate(attest_resp, tls_ekm)
+      self._perform_server_attestation()
 
       # Update timestamp on success
       self._last_attestation_time = time.time()
@@ -172,6 +140,66 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
       raise exceptions.AttestationHandshakeError(
           "Network error during attestation"
       ) from e
+
+  def _send_attestation_request(
+      self, request: attestation_pb2.AttestConnectionRequest
+  ) -> attestation_pb2.AttestConnectionResponse:
+    """Sends the attestation flight over the established TLS socket."""
+    json_body = json_format.MessageToJson(request)
+    # Note: We call the superclass's `request` method explicitly here to
+    # avoid a recursive loop during the handshake.
+    # Using HTTPConnection request method to send raw bytes.
+    super().request(
+        "POST",
+        constants.ATTESTATION_ENDPOINT,
+        body=json_body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, application/x-protobuf",
+        },
+    )
+    return self._process_attestation_response(self.getresponse())
+
+  def _perform_server_attestation(self) -> None:
+    """Runs the server-only exchange, challenging with a fresh client nonce."""
+    # A. Generate a fresh nonce
+    nonce = secrets.token_bytes(constants.NONCE_LENGTH)
+
+    attestation_req = attestation_pb2.AttestConnectionRequest(
+        required_verifier_type=[attestation_pb2.VerifierType.VERIFIER_TYPE_GCA],
+        nonce=nonce,
+    )
+    # B. Send Request
+    attest_resp = self._send_attestation_request(attestation_req)
+
+    # C. Export Keying Material
+    tls_ekm = self._ekm_exporter_fn(
+        self.sock,  # pyrefly: ignore[bad-argument-type]
+        constants.EKM_LENGTH,
+        constants.EKM_LABEL,
+        context=nonce,
+    )
+
+    # D. Validate
+    self._validate_server_proof(attest_resp, tls_ekm)
+
+  def _validate_server_proof(
+      self,
+      response: attestation_pb2.AttestConnectionResponse,
+      tls_ekm: bytes,
+  ) -> None:
+    """Validates a server proof.
+
+    Args:
+      response: The server's attestation proof.
+      tls_ekm: The exported keying material the proof is bound to.
+
+    Raises:
+      exceptions.AttestationVerificationError: If the proof does not verify.
+      exceptions.PolicyViolationError: If the server fails the policy check.
+    """
+    server_validator = self._attestation_validator_cls(self._policy)
+    server_validator.validate(response, tls_ekm)
 
   def connect(self) -> None:
     """Establishes the TLS connection and performs attestation."""

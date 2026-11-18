@@ -14,6 +14,8 @@
 
 """Constants for the Prompt Encryption SDK."""
 
+from prompt_encryption_sdk import attestation as attestation_protocol
+
 # The endpoint for the post-handshake attestation RPC.
 ATTESTATION_ENDPOINT: str = "/_attest-connection"
 
@@ -32,8 +34,8 @@ CS_DEFAULT_JWKS_URI: str = (
 CS_DEFAULT_ISSUER: str = "https://confidentialcomputing.googleapis.com"
 
 # TLS Exported Keying Material Parameters
-EKM_LABEL: bytes = b"EXPORTER-Prompt-Encryption-SDK"
-EKM_LENGTH: int = 32
+EKM_LABEL: bytes = attestation_protocol.EKM_LABEL
+EKM_LENGTH: int = attestation_protocol.EKM_LENGTH
 
 # Default revalidation interval in seconds (55 minutes).
 # GCA tokens typically expire in 1 hour, so we revalidate slightly before.
@@ -45,4 +47,3 @@ DEFAULT_AUDIENCE: str = "https://sts.google.com"
 ML_DSA_PUBLIC_KEY_TYPE_URL: str = (
     "type.googleapis.com/google.crypto.tink.MlDsaPublicKey"
 )
-

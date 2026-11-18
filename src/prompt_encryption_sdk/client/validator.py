@@ -22,6 +22,7 @@ import ssl
 import types
 from typing import Any
 
+from prompt_encryption_sdk import attestation as attestation_protocol
 from prompt_encryption_sdk.client import constants
 from prompt_encryption_sdk.client import exceptions
 from prompt_encryption_sdk.proto import attestation_pb2
@@ -357,14 +358,10 @@ class AttestationValidator:
 
     # Reconstruct the payload to verify the cryptographic binding of the
     # TLS session.
-    token_hash_bytes = hashlib.sha256(
-        gca_bundle.attestation_token.encode("utf-8")
-    ).digest()
-    ekm_hash_bytes = hashlib.sha256(tls_ekm).digest()
-    payload_msg = attestation_pb2.SessionSignaturePayload(
-        ekm_hash=ekm_hash_bytes, token_hash=token_hash_bytes
+    payload = attestation_protocol.build_signature_payload(
+        tls_ekm=tls_ekm,
+        attestation_token=gca_bundle.attestation_token.encode("utf-8"),
     )
-    payload = payload_msg.SerializeToString()
 
     # Verify classical signature
     self._verify_session_signature(

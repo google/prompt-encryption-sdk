@@ -57,6 +57,22 @@ message SessionSignaturePayload {
   bytes token_hash = 2;
 }
 
+// AttestationProof is role-neutral evidence that either endpoint can produce.
+// AttestConnectionResponse keeps its original top-level proof fields so the
+// server-only wire format is unchanged.
+message AttestationProof {
+  // The prover's attestation evidence. Its token binds both public keys.
+  repeated AttestationEvidence evidence = 1;
+  // The prover's ECDSA P-256 public key.
+  EcdsaP256PublicKey instance_public_key = 2;
+  // ECDSA signature over the SessionSignaturePayload.
+  bytes session_signature = 3;
+  // The prover's ML-DSA-65 public keyset.
+  MlDsaPublicKey pqc_public_key = 4;
+  // ML-DSA signature over the SessionSignaturePayload.
+  bytes pqc_session_signature = 5;
+}
+
 // AttestConnectionResponse is sent by the server to the client. It is sent only
 // if the server can satisfy all of the client's required RoTs.
 message AttestConnectionResponse {
