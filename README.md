@@ -9,6 +9,7 @@ This SDK is particularly useful for protecting sensitive data, ensuring that pro
 - **End-to-End Encryption**: Encrypts data in transit directly into the secure enclave, protecting it from intermediate infrastructure.
 - **Attested TLS**: Seamlessly ties Google Cloud Confidential Space attestation into the TLS handshake.
 - **Client & Server Support**: High-level primitives to build attested clients and compliant ASGI/WSGI servers.
+- **Mutual Attestation**: When the client also runs in a TEE, both peers can verify each other in a single round trip. See [Mutual Attestation](MUTUAL_ATTESTATION.md).
 
 ## Prerequisites
 
@@ -49,14 +50,18 @@ from prompt_encryption_sdk.proto import attestation_pb2
 # Define the attestation policy
 # The client will only establish a connection if the server satisfies these rules.
 policy = attestation_pb2.AttestationPolicy(
-    hw_model=attestation_pb2.HARDWARE_MODEL_SEV, # Or HARDWARE_MODEL_TDX
+    hw_model=attestation_pb2.HARDWARE_MODEL_SEV,  # Or HARDWARE_MODEL_TDX
     workload=attestation_pb2.WorkloadPolicy(
         image_hash="sha256:YOUR_EXPECTED_CONTAINER_IMAGE_HASH"
     ),
     gce_instance=attestation_pb2.GceInstancePolicy(
         project_id="your-project-id",
-        zone="us-central1-a"
-    )
+        zone="us-central1-a",
+    ),
+    confidential_space=attestation_pb2.ConfidentialSpacePolicy(
+        require_debug_disabled=True,
+        require_secboot=True,
+    ),
 )
 
 # Initialize the client with the policy
@@ -70,8 +75,10 @@ payload = {
 # Use the client to make requests
 try:
     with client.session() as http:
-        # verify=False bypasses standard TLS checks since we use Attested TLS.
-        # The connection's security is guaranteed by the TEE hardware attestation.
+        # Server-only mode only: verify=False skips standard certificate checks
+        # when the server uses a self-signed certificate, relying on TEE
+        # hardware attestation instead. Mutual mode must verify the server
+        # certificate (using a CA bundle or verify="/path/to/server.crt").
         response = http.post(target_url, json=payload, verify=False)
         print(f"Status: {response.status_code}")
         print(f"Data: {response.json()}")
@@ -81,7 +88,8 @@ except Exception as e:
 
 ### Server-Side Example
 
-The library provides high-level ASGI and WSGI middlewares in `prompt_encryption_sdk.server` for implementing an Attested TLS server easily.
+The library provides high-level ASGI and WSGI middlewares in
+`prompt_encryption_sdk.server` for implementing an Attested TLS server easily.
 
 ```python
 from fastapi import FastAPI

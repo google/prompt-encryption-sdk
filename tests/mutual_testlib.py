@@ -31,7 +31,7 @@ import hashlib
 import pathlib
 import secrets
 import time
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 from prompt_encryption_sdk import attestation
 from prompt_encryption_sdk.client import constants
@@ -409,3 +409,45 @@ def make_attested_tls(
       require_mutual_attestation=require_mutual_attestation,
       attestation_validator_cls=gca.validator_factory,
   )
+
+
+class TlsTestServer(Protocol):
+  """The parts of a `tls_testlib.TlsServer` that `enable_mutual` changes.
+
+  Attributes:
+    attested_tls: The handler behind the middleware.
+    middleware: The WSGI or ASGI middleware, which reads `attested_tls` on every
+      request.
+  """
+
+  attested_tls: server_attestation.AttestedTLS
+  middleware: Any
+
+
+def enable_mutual(
+    server: TlsTestServer,
+    gca: FakeGca,
+    *,
+    client_policy: attestation_pb2.AttestationPolicy,
+    require_mutual_attestation: bool = False,
+) -> None:
+  """Turns on mutual attestation on a `tls_testlib` WSGI or ASGI test server.
+
+  `tls_testlib` makes the server with no client policy, and the safety tests
+  must not change, so this replaces the handler behind the middleware. Call it
+  before the first connection.
+
+  Args:
+    server: A `tls_testlib.WsgiTlsServer` or `tls_testlib.AsgiTlsServer`.
+    gca: Verifies the client tokens.
+    client_policy: The policy that clients must satisfy.
+    require_mutual_attestation: Whether to reject server-only clients.
+  """
+  attested_tls = make_attested_tls(
+      server.attested_tls.token_manager,
+      gca,
+      client_policy=client_policy,
+      require_mutual_attestation=require_mutual_attestation,
+  )
+  server.attested_tls = attested_tls
+  server.middleware.attested_tls = attested_tls

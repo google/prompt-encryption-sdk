@@ -141,6 +141,32 @@ By verifying this entire chain (Hardware $$\rightarrow$$ Token $$\rightarrow$$ I
 
 ---
 
+## Mutual Attestation
+When the client also runs inside a TEE, the same single `/_attest-connection`
+round trip can verify both directions: the client's proof travels in the
+request, the server verifies it before producing its own, and the server's
+proof travels back in the response.
+
+That exchange drops the client and server nonces entirely and uses the TLS 1.3
+Exported Keying Material as the challenge — the EKM is already derived from
+both peers' handshake randoms, so it is unique and unforgeable per session.
+Both peers refuse the mutual exchange over any other TLS version.
+The consequence is that the binding is constant for the session's lifetime, so
+a mutually attested session is attested exactly once and is never revalidated;
+re-attestation means opening a new connection.
+
+The binding never decays, but the evidence behind it does. The server records
+when the client's attestation token expires, and the client records the
+earlier of the two tokens' expiry times. Each stops using the connection at
+that point: the server answers `401` with `Connection: close`, and the client
+retires the connection from its pool 60 seconds early so the next request opens
+a fresh one.
+
+See [Mutual Attestation](MUTUAL_ATTESTATION.md) for the protocol, the role/mode
+domain separation that replaces the nonces, and the API.
+
+---
+
 ## Threat Model Matrix & Security Considerations
 ### What the SDK Protects Against
 | Threat | Protected? | Mechanism |

@@ -14,6 +14,11 @@ These tests protect the existing server-only mode from regressions:
     reconnection on the WSGI server and on the ASGI server.
 -   `../codelab_api_test.py`: the SDK names that the codelab uses.
 
+`mutual_attestation_tls_integration_test.py` tests mutual attestation on the
+WSGI server and on the ASGI server: the single round trip, policy rejection,
+the TLS 1.3 requirement, re-attestation, and token expiry. It uses the shared
+fakes in `../mutual_testlib.py`.
+
 ## Run the tests
 
 Install the package with the server and test dependencies. Then run pytest from
