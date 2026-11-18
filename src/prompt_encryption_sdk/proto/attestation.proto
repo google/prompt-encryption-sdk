@@ -15,11 +15,40 @@ enum VerifierType {
   VERIFIER_TYPE_GCA = 1;
 }
 
+// AttestationMode is selected by the client on its single attestation flight.
+// The zero value is intentionally server-only so requests from existing
+// clients keep their current behavior.
+enum AttestationMode {
+  ATTESTATION_MODE_SERVER_ONLY = 0;
+  ATTESTATION_MODE_MUTUAL = 1;
+}
+
+// AttestationPeerRole prevents a proof produced by one side from being
+// reflected back and accepted as a proof for the other side.
+enum AttestationPeerRole {
+  // Used by server-only proofs, which predate peer roles.
+  ATTESTATION_PEER_ROLE_UNSPECIFIED = 0;
+  ATTESTATION_PEER_ROLE_SERVER = 1;
+  ATTESTATION_PEER_ROLE_CLIENT = 2;
+}
+
 message AttestConnectionRequest {
   // A list of verifiers that the server must be endorsed by.
   repeated VerifierType required_verifier_type = 1;
-  // A random nonce for generating unique TLS session material.
+  // A random nonce for generating unique TLS session material. Server-only
+  // mode uses it as the EKM context. Mutual mode derives freshness from the
+  // TLS session itself, so this field must be empty there.
   bytes nonce = 2;
+  // Protocol version 0 is the server-only flow. Mutual attestation uses
+  // version 1 and fails closed if the peer does not echo it.
+  int32 protocol_version = 3;
+  // The attestation mode that the client asks for. SERVER_ONLY (the default)
+  // keeps the existing flow.
+  AttestationMode mode = 4;
+  // The client's own TEE proof. Present only in mutual mode, where it makes
+  // the exchange a single round trip: the client proves itself in the request
+  // and the server proves itself in the response.
+  AttestationProof client_attestation = 5;
 }
 
 // GcaTrustBundle contains the materials needed to verify a GCA-based
@@ -48,13 +77,23 @@ message MlDsaPublicKey {
 }
 
 // SessionSignaturePayload binds the attestation to the TLS session.
-// It is signed by the server's private key.
+// It is signed by the producing peer's ECDSA and ML-DSA keys.
 message SessionSignaturePayload {
   // The raw 32-byte SHA-256 hash of the 32-byte Exported Keying Material (EKM)
   // from the TLS session.
   bytes ekm_hash = 1;
   // The raw 32-byte SHA-256 hash of the attestation token.
   bytes token_hash = 2;
+  // The remaining fields are absent on the wire for server-only proofs,
+  // preserving their existing canonical signed payload byte-for-byte.
+  //
+  // Which endpoint produced this proof. Both peers bind to the same EKM in
+  // mutual mode, so the role is what stops a proof from being reflected.
+  AttestationPeerRole peer_role = 3;
+  // The negotiated mode, which pins the semantics of the signed binding.
+  AttestationMode mode = 4;
+  // The protocol version the proof was produced under.
+  int32 protocol_version = 5;
 }
 
 // AttestationProof is role-neutral evidence that either endpoint can produce.
@@ -87,6 +126,17 @@ message AttestConnectionResponse {
   MlDsaPublicKey pqc_public_key = 4;
   // PQC signature over the SessionSignaturePayload
   bytes pqc_session_signature = 5;
+  // Unauthenticated negotiation echo (fields 6-8 are not signed). Default or
+  // absent in the server-only flow; checked first to give an early, clear error
+  // against a server that does not support mutual mode. Downgrade resistance
+  // comes from the signed `SessionSignaturePayload.mode`.
+  int32 protocol_version = 6;
+  // The attestation mode echoed by the server. A mutual client requires MUTUAL
+  // here before verifying the signed `SessionSignaturePayload.mode`.
+  AttestationMode mode = 7;
+  // Unauthenticated metadata set once the server has verified this client's
+  // proof; diagnostic echo only, not an authorization signal.
+  bool mutual_attestation_complete = 8;
 }
 
 // Enum for the supported TEE hardware CPU models.

@@ -74,6 +74,119 @@ class BuildSignaturePayloadTest(parameterized.TestCase):
         legacy,
     )
 
+  @parameterized.named_parameters(
+      (
+          "client",
+          attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+          (
+              "0a20dfb417454d7432715ecfaa33d89abdaba4457c3b2cbd85a4a20620d0cd806da6"
+              "1220617fcb62ce2800030aa6a89e781a46cbadb3c32a233b33af5adaa69441c0bce4"
+              "180220012801"
+          ),
+      ),
+      (
+          "server",
+          attestation_pb2.ATTESTATION_PEER_ROLE_SERVER,
+          (
+              "0a20dfb417454d7432715ecfaa33d89abdaba4457c3b2cbd85a4a20620d0cd806da6"
+              "1220617fcb62ce2800030aa6a89e781a46cbadb3c32a233b33af5adaa69441c0bce4"
+              "180120012801"
+          ),
+      ),
+  )
+  def test_mutual_payload_carries_role_mode_and_version(
+      self, peer_role, expected_hex
+  ):
+    self.assertEqual(
+        attestation_protocol.MUTUAL_ATTESTATION_PROTOCOL_VERSION, 1
+    )
+    self.assertEqual(
+        attestation_protocol.build_signature_payload(
+            tls_ekm=_EKM,
+            attestation_token=_TOKEN,
+            peer_role=peer_role,
+            mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        ),
+        bytes.fromhex(expected_hex),
+    )
+
+  def test_roles_produce_distinct_payloads_for_the_same_ekm(self):
+    """Role separation is the only thing preventing proof reflection."""
+    server = attestation_protocol.build_signature_payload(
+        tls_ekm=_EKM,
+        attestation_token=_TOKEN,
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_SERVER,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+    )
+    client = attestation_protocol.build_signature_payload(
+        tls_ekm=_EKM,
+        attestation_token=_TOKEN,
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+    )
+
+    self.assertNotEqual(server, client)
+
+  def test_modes_produce_distinct_payloads_for_the_same_ekm(self):
+    mutual = attestation_protocol.build_signature_payload(
+        tls_ekm=_EKM,
+        attestation_token=_TOKEN,
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_SERVER,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+    )
+    server_only = attestation_protocol.build_signature_payload(
+        tls_ekm=_EKM,
+        attestation_token=_TOKEN,
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_UNSPECIFIED,
+        mode=attestation_pb2.ATTESTATION_MODE_SERVER_ONLY,
+    )
+
+    self.assertNotEqual(mutual, server_only)
+
+  @parameterized.named_parameters(
+      (
+          "mutual_unspecified_role",
+          attestation_pb2.ATTESTATION_MODE_MUTUAL,
+          attestation_pb2.ATTESTATION_PEER_ROLE_UNSPECIFIED,
+      ),
+      (
+          "server_only_client_role",
+          attestation_pb2.ATTESTATION_MODE_SERVER_ONLY,
+          attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+      ),
+      (
+          "server_only_server_role",
+          attestation_pb2.ATTESTATION_MODE_SERVER_ONLY,
+          attestation_pb2.ATTESTATION_PEER_ROLE_SERVER,
+      ),
+  )
+  def test_rejects_invalid_mode_and_role_combinations(self, mode, peer_role):
+    with self.assertRaisesRegex(
+        ValueError, r"Invalid \(mode, peer_role\) combination"
+    ):
+      attestation_protocol.build_signature_payload(
+          tls_ekm=_EKM,
+          attestation_token=_TOKEN,
+          peer_role=peer_role,
+          mode=mode,
+      )
+
+  def test_payload_is_deterministic(self):
+    self.assertEqual(
+        attestation_protocol.build_signature_payload(
+            tls_ekm=_EKM,
+            attestation_token=_TOKEN,
+            peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+            mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        ),
+        attestation_protocol.build_signature_payload(
+            tls_ekm=_EKM,
+            attestation_token=_TOKEN,
+            peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+            mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        ),
+    )
+
 
 class AttestationProverTest(parameterized.TestCase):
 
@@ -97,10 +210,17 @@ class AttestationProverTest(parameterized.TestCase):
   def test_create_proof_signs_the_canonical_payload_with_both_keys(self):
     identity = self._identity()
 
-    proof = attestation_protocol.AttestationProver(identity).create_proof(_EKM)
+    proof = attestation_protocol.AttestationProver(identity).create_proof(
+        _EKM,
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+    )
 
     expected_payload = attestation_protocol.build_signature_payload(
-        tls_ekm=_EKM, attestation_token=_TOKEN
+        tls_ekm=_EKM,
+        attestation_token=_TOKEN,
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
     )
     identity.key_manager.sign_payload.assert_called_once_with(expected_payload)
     identity.key_manager.sign_payload_mldsa.assert_called_once_with(
@@ -149,11 +269,28 @@ class ProofResponseConversionTest(parameterized.TestCase):
         pqc_session_signature=b"pqc-sig",
     )
 
+  def test_server_only_response_has_no_mutual_echo(self):
+    response = attestation_protocol.response_from_proof(self._proof())
+
+    self.assertEqual(response.protocol_version, 0)
+    self.assertEqual(
+        response.mode, attestation_pb2.ATTESTATION_MODE_SERVER_ONLY
+    )
+    self.assertFalse(response.mutual_attestation_complete)
+
   def test_populates_response_fields_from_proof(self):
     proof = self._proof()
 
-    response = attestation_protocol.response_from_proof(proof)
+    response = attestation_protocol.response_from_proof(
+        proof,
+        protocol_version=1,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+        mutual_attestation_complete=True,
+    )
 
+    self.assertEqual(response.protocol_version, 1)
+    self.assertEqual(response.mode, attestation_pb2.ATTESTATION_MODE_MUTUAL)
+    self.assertTrue(response.mutual_attestation_complete)
     self.assertEqual(list(response.evidence), list(proof.evidence))
     self.assertEqual(response.instance_public_key, proof.instance_public_key)
     self.assertEqual(response.session_signature, proof.session_signature)

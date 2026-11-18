@@ -22,6 +22,7 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from prompt_encryption_sdk import attestation as attestation_protocol
 from prompt_encryption_sdk.client import constants
 from prompt_encryption_sdk.client import exceptions
 from prompt_encryption_sdk.client import validator
@@ -30,7 +31,6 @@ import jwt
 import requests
 import tink
 from tink import jwt as tink_jwt
-
 
 # --- Deterministic Test Constants ---
 # Using fixed constants ensures tests are hermetic and repeatable.
@@ -152,6 +152,38 @@ class AttestationValidatorTest(parameterized.TestCase):
     ):
       self.validator._verify_instance_key_binding(
           claims, _FAKE_PUB_KEY, _FAKE_PQC_PUB_KEY
+      )
+
+  @parameterized.named_parameters(
+      ("int", 123),
+      ("bool", True),
+      (
+          "dict_keyed_by_fingerprints",
+          dict.fromkeys(_get_valid_claims()["eat_nonce"], 1),
+      ),
+      ("list_with_a_non_string", _get_valid_claims()["eat_nonce"] + [7]),
+  )
+  def test_verify_instance_key_binding_rejects_a_malformed_nonce(
+      self, eat_nonce
+  ):
+    """A peer token whose eat_nonce is not a string list fails closed."""
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError,
+        "must be a string or a list of strings",
+    ):
+      self.validator._verify_instance_key_binding(
+          {"eat_nonce": eat_nonce}, _FAKE_PUB_KEY, _FAKE_PQC_PUB_KEY
+      )
+
+  def test_verify_instance_key_binding_rejects_identical_key_fingerprints(self):
+    """A scalar eat_nonce cannot satisfy both key bindings via one digest."""
+    shared_digest = hashlib.sha256(_FAKE_PUB_KEY).hexdigest()
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError,
+        "ECDSA and PQC instance key fingerprints must be distinct",
+    ):
+      self.validator._verify_instance_key_binding(
+          {"eat_nonce": shared_digest}, _FAKE_PUB_KEY, _FAKE_PUB_KEY
       )
 
   def test_verify_nonce_success(self):
@@ -1221,7 +1253,9 @@ class AttestationValidatorTest(parameterized.TestCase):
   def test_verify_session_signature_mldsa_wrong_key_type(self, mock_parse):
     mock_handle = mock.Mock()
     mock_handle.keyset_info.return_value.key_info = [
-        mock.Mock(type_url="type.googleapis.com/google.crypto.tink.EcdsaPublicKey")
+        mock.Mock(
+            type_url="type.googleapis.com/google.crypto.tink.EcdsaPublicKey"
+        )
     ]
     mock_parse.return_value = mock_handle
 
@@ -1249,9 +1283,7 @@ class AttestationValidatorTest(parameterized.TestCase):
         )
     )
 
-    signer = private_handle.primitive(
-        validator.tink_signature.PublicKeySign
-    )
+    signer = private_handle.primitive(validator.tink_signature.PublicKeySign)
     payload = b"test_payload_bytes"
     signature_bytes = signer.sign(payload)
 
@@ -1316,6 +1348,145 @@ class AttestationValidatorTest(parameterized.TestCase):
         "valid.jwt.payload",
         **expected_kwargs,
     )
+
+
+class ValidateProofTest(parameterized.TestCase):
+  """`validate_proof` checks the role and the mode that the proof is bound to."""
+
+  _EKM = b"session-ekm"
+  _TOKEN = "valid.jwt.payload"
+
+  def setUp(self):
+    super().setUp()
+    self.enter_context(
+        mock.patch.object(requests.Session, "get", autospec=True)
+    )
+    self.enter_context(
+        mock.patch.object(
+            validator.OIDCTokenValidator,
+            "validate_token",
+            autospec=True,
+            return_value=_get_valid_claims(),
+        )
+    )
+    self.validator = validator.AttestationValidator(
+        attestation_pb2.AttestationPolicy()
+    )
+    # Both signature checks accept only the payload of a mutual client proof,
+    # as real signatures over that payload would.
+    signed_payload = attestation_protocol.build_signature_payload(
+        tls_ekm=self._EKM,
+        attestation_token=self._TOKEN.encode("utf-8"),
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+    )
+
+    def verify(public_key, *, signature, payload):
+      del public_key, signature  # Unused.
+      if payload != signed_payload:
+        raise exceptions.AttestationVerificationError("Bad signature.")
+
+    for name in (
+        "_verify_session_signature",
+        "_verify_session_signature_mldsa",
+    ):
+      self.enter_context(
+          mock.patch.object(
+              self.validator, name, autospec=True, side_effect=verify
+          )
+      )
+    self.proof = attestation_pb2.AttestationProof(
+        evidence=[
+            attestation_pb2.AttestationEvidence(
+                verifier_type=attestation_pb2.VERIFIER_TYPE_GCA,
+                gca_bundle=attestation_pb2.GcaTrustBundle(
+                    attestation_token=self._TOKEN
+                ),
+            )
+        ],
+        instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+            key_bytes=_FAKE_PUB_KEY
+        ),
+        session_signature=_FAKE_SESSION_SIGNATURE,
+        pqc_public_key=attestation_pb2.MlDsaPublicKey(
+            serialized_public_keyset=_FAKE_PQC_PUB_KEY
+        ),
+        pqc_session_signature=_FAKE_PQC_SESSION_SIGNATURE,
+    )
+
+  def test_returns_the_claims_for_the_signed_role_and_mode(self):
+    claims = self.validator.validate_proof(
+        self.proof,
+        self._EKM,
+        peer_role=attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+        mode=attestation_pb2.ATTESTATION_MODE_MUTUAL,
+    )
+
+    self.assertEqual(claims, _get_valid_claims())
+
+  @parameterized.named_parameters(
+      (
+          "server_role",
+          attestation_pb2.ATTESTATION_PEER_ROLE_SERVER,
+          attestation_pb2.ATTESTATION_MODE_MUTUAL,
+      ),
+      (
+          "server_only_mode",
+          attestation_pb2.ATTESTATION_PEER_ROLE_UNSPECIFIED,
+          attestation_pb2.ATTESTATION_MODE_SERVER_ONLY,
+      ),
+  )
+  def test_rejects_another_role_or_mode(self, peer_role, mode):
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError, "Bad signature"
+    ):
+      self.validator.validate_proof(
+          self.proof, self._EKM, peer_role=peer_role, mode=mode
+      )
+
+  @parameterized.named_parameters(
+      (
+          "mutual_with_unspecified_role",
+          attestation_pb2.ATTESTATION_PEER_ROLE_UNSPECIFIED,
+          attestation_pb2.ATTESTATION_MODE_MUTUAL,
+      ),
+      (
+          "server_only_with_client_role",
+          attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+          attestation_pb2.ATTESTATION_MODE_SERVER_ONLY,
+      ),
+  )
+  def test_rejects_invalid_role_and_mode_pair(self, peer_role, mode):
+    with self.assertRaisesRegex(
+        ValueError, r"Invalid \(mode, peer_role\) combination"
+    ):
+      self.validator.validate_proof(
+          self.proof, self._EKM, peer_role=peer_role, mode=mode
+      )
+
+
+class VerifiedExpiryTest(parameterized.TestCase):
+
+  @parameterized.parameters(1_700_000_000, 1_700_000_000.5)
+  def test_returns_a_finite_exp(self, exp):
+    expiry = validator.verified_expiry({"exp": exp})
+
+    self.assertIsInstance(expiry, float)
+    self.assertEqual(expiry, exp)
+
+  @parameterized.named_parameters(
+      ("missing", {}),
+      ("nan", {"exp": float("nan")}),
+      ("infinity", {"exp": float("inf")}),
+      ("bool", {"exp": True}),
+      ("string", {"exp": "1700000000"}),
+      ("too_large_for_a_float", {"exp": 10**400}),
+  )
+  def test_rejects_an_unusable_exp(self, claims):
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError, "must be a finite number"
+    ):
+      validator.verified_expiry(claims)
 
 
 class OIDCTokenValidatorTest(parameterized.TestCase):
@@ -1405,7 +1576,9 @@ class OIDCTokenValidatorTest(parameterized.TestCase):
     mock_keyset_handle.primitive.return_value = mock_verifier
     mock_jwk_set_to_public_keyset_handle.return_value = mock_keyset_handle
 
-    mock_verifier.verify_and_decode.side_effect = tink.TinkError("Bad Signature")
+    mock_verifier.verify_and_decode.side_effect = tink.TinkError(
+        "Bad Signature"
+    )
 
     v = validator.OIDCTokenValidator()
 

@@ -14,9 +14,15 @@
 
 """Shared proof primitives for post-handshake attested TLS.
 
-The server proves its TEE identity with a proof bound to the TLS session. The
-code that builds and signs that proof lives here, not in the server package,
-so that a client that runs in a TEE can later produce the same proof.
+Both endpoints produce the same shape of proof, so the signing logic lives
+here rather than in the server package. Mutual attestation is a single round
+trip: the client puts its proof in the request, the server verifies it and
+puts its own proof in the response.
+
+In mutual mode, neither side contributes a nonce. The TLS 1.3 Exported Keying
+Material (RFC 5705, RFC 8446 section 7.5) is already unique to the session -- it
+is derived from both peers' handshake randoms and the ephemeral key exchange --
+so it *is* the freshness challenge.
 """
 
 from collections.abc import Sequence
@@ -24,6 +30,9 @@ import hashlib
 from typing import Protocol
 
 from prompt_encryption_sdk.proto import attestation_pb2
+
+# Wire version of the mutual exchange. Version 0 is the server-only flow.
+MUTUAL_ATTESTATION_PROTOCOL_VERSION: int = 1
 
 # TLS Exported Keying Material (RFC 5705) parameters.
 EKM_LABEL: bytes = b"EXPORTER-Prompt-Encryption-SDK"
@@ -87,19 +96,53 @@ def build_signature_payload(
     *,
     tls_ekm: bytes,
     attestation_token: bytes,
+    peer_role: attestation_pb2.AttestationPeerRole = (
+        attestation_pb2.ATTESTATION_PEER_ROLE_UNSPECIFIED
+    ),
+    mode: attestation_pb2.AttestationMode = (
+        attestation_pb2.ATTESTATION_MODE_SERVER_ONLY
+    ),
 ) -> bytes:
   """Builds the canonical payload signed by both the classical and PQC keys.
+
+  In mutual mode both peers bind to the *same* EKM, so `peer_role` and `mode`
+  are the domain separators that keep one side's proof from being replayed as
+  the other's.
 
   Args:
     tls_ekm: Exported Keying Material for this TLS session.
     attestation_token: The raw GCA attestation token bytes.
+    peer_role: Which endpoint produced the proof.
+    mode: The negotiated attestation mode.
 
   Returns:
-    The serialized SessionSignaturePayload.
+    The serialized SessionSignaturePayload. For server-only proofs every added
+    field is at its default and therefore absent from the wire, so the bytes
+    are unchanged from the pre-mutual-attestation SDK.
+
+  Raises:
+    ValueError: If `mode` and `peer_role` do not form a valid combination.
   """
+  if (
+      mode == attestation_pb2.ATTESTATION_MODE_SERVER_ONLY
+      and peer_role == attestation_pb2.ATTESTATION_PEER_ROLE_UNSPECIFIED
+  ):
+    protocol_version = 0
+  elif mode == attestation_pb2.ATTESTATION_MODE_MUTUAL and peer_role in (
+      attestation_pb2.ATTESTATION_PEER_ROLE_CLIENT,
+      attestation_pb2.ATTESTATION_PEER_ROLE_SERVER,
+  ):
+    protocol_version = MUTUAL_ATTESTATION_PROTOCOL_VERSION
+  else:
+    raise ValueError(
+        f"Invalid (mode, peer_role) combination: ({mode!r}, {peer_role!r})."
+    )
   return attestation_pb2.SessionSignaturePayload(
       ekm_hash=hashlib.sha256(tls_ekm).digest(),
       token_hash=hashlib.sha256(attestation_token).digest(),
+      peer_role=peer_role,
+      mode=mode,
+      protocol_version=protocol_version,
   ).SerializeToString(deterministic=True)
 
 
@@ -118,11 +161,23 @@ class AttestationProver:
   def __repr__(self) -> str:
     return f"AttestationProver(identity={self._identity!r})"
 
-  def create_proof(self, tls_ekm: bytes) -> attestation_pb2.AttestationProof:
+  def create_proof(
+      self,
+      tls_ekm: bytes,
+      *,
+      peer_role: attestation_pb2.AttestationPeerRole = (
+          attestation_pb2.ATTESTATION_PEER_ROLE_UNSPECIFIED
+      ),
+      mode: attestation_pb2.AttestationMode = (
+          attestation_pb2.ATTESTATION_MODE_SERVER_ONLY
+      ),
+  ) -> attestation_pb2.AttestationProof:
     """Creates an ECDSA + ML-DSA proof for the supplied channel binding.
 
     Args:
       tls_ekm: Exported Keying Material for this TLS session.
+      peer_role: The role this endpoint plays in the exchange.
+      mode: The negotiated attestation mode.
 
     Returns:
       An AttestationProof carrying the GCA token, both public keys, and both
@@ -130,6 +185,7 @@ class AttestationProver:
 
     Raises:
       RuntimeError: If this endpoint has no attestation token yet.
+      ValueError: If `mode` and `peer_role` do not form a valid combination.
     """
     ecdsa_public_key, pqc_public_key, attestation_token = (
         self._identity.get_identity_snapshot()
@@ -138,7 +194,10 @@ class AttestationProver:
       raise RuntimeError("Attestation identity has no token.")
 
     payload = build_signature_payload(
-        tls_ekm=tls_ekm, attestation_token=attestation_token
+        tls_ekm=tls_ekm,
+        attestation_token=attestation_token,
+        peer_role=peer_role,
+        mode=mode,
     )
     return attestation_pb2.AttestationProof(
         evidence=[
@@ -164,20 +223,32 @@ class AttestationProver:
 
 def response_from_proof(
     proof: attestation_pb2.AttestationProof,
+    *,
+    protocol_version: int = 0,
+    mode: attestation_pb2.AttestationMode = (
+        attestation_pb2.ATTESTATION_MODE_SERVER_ONLY
+    ),
+    mutual_attestation_complete: bool = False,
 ) -> attestation_pb2.AttestConnectionResponse:
   """Copies a proof into the AttestConnectionResponse wire shape.
 
   Args:
     proof: The server's proof.
+    protocol_version: The negotiated protocol version to echo.
+    mode: The negotiated attestation mode to echo.
+    mutual_attestation_complete: Whether the client's proof was verified.
 
   Returns:
-    An AttestConnectionResponse carrying the proof.
+    An AttestConnectionResponse carrying the proof and the echoed fields.
   """
   response = attestation_pb2.AttestConnectionResponse(
       instance_public_key=proof.instance_public_key,
       session_signature=proof.session_signature,
       pqc_public_key=proof.pqc_public_key,
       pqc_session_signature=proof.pqc_session_signature,
+      protocol_version=protocol_version,
+      mode=mode,
+      mutual_attestation_complete=mutual_attestation_complete,
   )
   response.evidence.extend(proof.evidence)
   return response
