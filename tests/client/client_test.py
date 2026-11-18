@@ -14,12 +14,13 @@
 
 from unittest import mock
 
-from absl.testing import parameterized
+from prompt_encryption_sdk import attestation as attestation_protocol
 from prompt_encryption_sdk.client import client
 from prompt_encryption_sdk.client import connection
 import requests
 
 from absl.testing import absltest as googletest
+from absl.testing import parameterized
 
 
 class TestAttestedHTTPSAdapter(googletest.TestCase):
@@ -36,8 +37,7 @@ class TestAttestedHTTPSAdapter(googletest.TestCase):
     )
 
   def test_init_sets_attributes_correctly(self):
-    """Tests that init stores policy and timeout correctly.
-    """
+    """Tests that init stores policy and timeout correctly."""
     self.assertEqual(self.adapter._policy, self.mock_policy)
     self.assertEqual(self.adapter._revalidation_timeout, self.timeout)
 
@@ -129,8 +129,7 @@ class TestPromptEncryptionClient(parameterized.TestCase):
       mock_adapter_cls,
       mock_session_cls,
   ):
-    """Tests that session() creates a session and mounts the adapter correctly.
-    """
+    """Creates a session and mounts the adapter on `https://` only."""
     sdk = client.PromptEncryptionClient(
         self.mock_policy, revalidation_timeout=777
     )
@@ -162,8 +161,7 @@ class TestPromptEncryptionClient(parameterized.TestCase):
 
   @mock.patch.object(client.PromptEncryptionClient, "session", autospec=True)
   def test_post_classmethod(self, mock_session_method):
-    """Tests that post() creates a client, opens a session, posts data, and returns result.
-    """
+    """Builds a client, opens a session, posts the data, returns the result."""
     # Setup
     url = "https://example.com/infer"
     data = {"key": "value"}
@@ -206,6 +204,155 @@ class TestPromptEncryptionClient(parameterized.TestCase):
     with self.subTest("ContextManagerExited"):
       # 4. Verify context manager exit was called (ensures session is closed)
       mock_session_method.return_value.__exit__.assert_called_once()
+
+
+class MutualPromptEncryptionClientTest(parameterized.TestCase):
+  """Covers the mutual-attestation configuration surface."""
+
+  def setUp(self):
+    super().setUp()
+    self.mock_policy = mock.create_autospec(
+        client.attestation_pb2.AttestationPolicy
+    )
+    self.token_manager = mock.create_autospec(
+        attestation_protocol.IdentitySnapshotProvider, instance=True
+    )
+
+  def test_mutual_requires_a_client_token_manager(self):
+    with self.assertRaisesRegex(ValueError, "client_token_manager is required"):
+      client.PromptEncryptionClient(self.mock_policy, mutual_attestation=True)
+
+  def test_a_client_token_manager_requires_mutual_attestation(self):
+    """Otherwise the client would silently attest only the server."""
+    with self.assertRaisesRegex(ValueError, "valid only when"):
+      client.PromptEncryptionClient(
+          self.mock_policy, client_token_manager=self.token_manager
+      )
+
+  def test_the_adapter_checks_the_mutual_settings(self):
+    prover = mock.create_autospec(
+        attestation_protocol.AttestationProver, instance=True
+    )
+    with self.subTest("ProverWithoutMutual"):
+      with self.assertRaisesRegex(ValueError, "valid only when"):
+        client.AttestedHTTPSAdapter(
+            policy=self.mock_policy,
+            revalidation_timeout=None,
+            attestation_prover=prover,
+        )
+    with self.subTest("MutualWithoutProver"):
+      with self.assertRaisesRegex(ValueError, "attestation_prover is required"):
+        client.AttestedHTTPSAdapter(
+            policy=self.mock_policy,
+            revalidation_timeout=None,
+            mutual_attestation=True,
+        )
+
+  def test_mutual_rejects_a_revalidation_timeout(self):
+    """A mutually attested session is attested exactly once."""
+    with self.assertRaisesRegex(
+        ValueError, "revalidation_timeout is not supported"
+    ):
+      client.PromptEncryptionClient(
+          self.mock_policy,
+          mutual_attestation=True,
+          client_token_manager=self.token_manager,
+          revalidation_timeout=600,
+      )
+
+  @mock.patch.object(attestation_protocol, "AttestationProver", autospec=True)
+  @mock.patch.object(requests, "Session", autospec=True)
+  @mock.patch.object(client, "AttestedHTTPSAdapter", autospec=True)
+  def test_session_wires_a_prover_over_the_client_identity(
+      self, mock_adapter_cls, mock_session_cls, mock_prover_cls
+  ):
+    del mock_session_cls
+    sdk = client.PromptEncryptionClient(
+        self.mock_policy,
+        mutual_attestation=True,
+        client_token_manager=self.token_manager,
+    )
+
+    sdk.session()
+
+    mock_prover_cls.assert_called_once_with(self.token_manager)
+    adapter_kwargs = mock_adapter_cls.call_args.kwargs
+    self.assertTrue(adapter_kwargs["mutual_attestation"])
+    self.assertIs(
+        adapter_kwargs["attestation_prover"],
+        mock_prover_cls.return_value,
+    )
+
+  def test_session_revalidates_fields_mutated_after_init(self):
+    with self.subTest("ClearedTokenManager"):
+      sdk = client.PromptEncryptionClient(
+          self.mock_policy,
+          mutual_attestation=True,
+          client_token_manager=self.token_manager,
+      )
+      sdk.client_token_manager = None
+      with self.assertRaisesRegex(
+          ValueError, "client_token_manager is required"
+      ):
+        sdk.session()
+
+    with self.subTest("EnabledMutualWithoutTokenManager"):
+      sdk = client.PromptEncryptionClient(self.mock_policy)
+      sdk.mutual_attestation = True
+      sdk.client_token_manager = None
+      with self.assertRaisesRegex(
+          ValueError, "client_token_manager is required"
+      ):
+        sdk.session()
+
+  @mock.patch.object(requests, "Session", autospec=True)
+  @mock.patch.object(client, "AttestedHTTPSAdapter", autospec=True)
+  def test_server_only_session_has_no_prover(
+      self, mock_adapter_cls, mock_session_cls
+  ):
+    del mock_session_cls
+    sdk = client.PromptEncryptionClient(self.mock_policy)
+
+    sdk.session()
+
+    adapter_kwargs = mock_adapter_cls.call_args.kwargs
+    self.assertNotIn("mutual_attestation", adapter_kwargs)
+    self.assertNotIn("attestation_prover", adapter_kwargs)
+
+  @mock.patch.object(connection, "AttestedPoolManager", autospec=True)
+  def test_a_mutual_adapter_builds_a_mutual_pool_manager(
+      self, mock_pool_manager
+  ):
+    prover = mock.create_autospec(
+        attestation_protocol.AttestationProver, instance=True
+    )
+    adapter = client.AttestedHTTPSAdapter(
+        policy=self.mock_policy,
+        revalidation_timeout=None,
+        mutual_attestation=True,
+        attestation_prover=prover,
+    )
+    mock_pool_manager.reset_mock()
+
+    adapter.init_poolmanager(10, 20)
+
+    pool_kwargs = mock_pool_manager.call_args.kwargs
+    self.assertTrue(pool_kwargs["mutual_attestation"])
+    self.assertIs(pool_kwargs["attestation_prover"], prover)
+
+  @mock.patch.object(client.PromptEncryptionClient, "session", autospec=True)
+  def test_post_forwards_the_mutual_configuration(self, mock_session_method):
+    client.PromptEncryptionClient.post(
+        self.mock_policy,
+        "https://example.com/infer",
+        {"key": "value"},
+        mutual_attestation=True,
+        client_token_manager=self.token_manager,
+    )
+
+    (client_instance,), _ = mock_session_method.call_args
+    self.assertTrue(client_instance.mutual_attestation)
+    self.assertIs(client_instance.client_token_manager, self.token_manager)
 
 
 if __name__ == "__main__":
