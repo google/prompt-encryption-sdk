@@ -252,9 +252,10 @@ class AttestedTLS:
       AttestationVerificationError: If the client's proof does not verify, or
         its token has no usable expiry.
       PolicyViolationError: If the client fails `client_policy`.
-      ValueError: If the request is malformed or asks for an unsupported
-        verifier, mode, or protocol version, or if a mutual request arrives
-        over a session that is not TLS 1.3.
+      AttestationRequestError: If the request is malformed or asks for an
+        unsupported verifier, mode, or protocol version, if the server does not
+        accept the requested mode, or if a mutual request arrives over a
+        session that is not TLS 1.3.
       RuntimeError: If EKM extraction fails, or if this server has no
         attestation token yet.
     """
@@ -271,17 +272,21 @@ class AttestedTLS:
       return self._attest_mutual(request, ssl_obj=ssl_obj)
 
     if request.mode != attestation_pb2.ATTESTATION_MODE_SERVER_ONLY:
-      raise ValueError(f"Unsupported attestation mode: {request.mode}")
+      raise attestation_protocol.AttestationRequestError(
+          f"Unsupported attestation mode: {request.mode}"
+      )
     if self._require_mutual_attestation:
-      raise ValueError("This server requires mutual attestation.")
+      raise attestation_protocol.AttestationRequestError(
+          "This server requires mutual attestation."
+      )
     if request.HasField("client_attestation"):
-      raise ValueError(
+      raise attestation_protocol.AttestationRequestError(
           "client_attestation is valid only for mutual attestation."
       )
     if request.protocol_version != 0:
       # An unknown mode value parses as SERVER_ONLY, so a request from a newer
       # protocol must not get a server-only answer.
-      raise ValueError(
+      raise attestation_protocol.AttestationRequestError(
           "Unsupported server-only protocol version:"
           f" {request.protocol_version}"
       )
@@ -319,18 +324,20 @@ class AttestedTLS:
         request.protocol_version
         != attestation_protocol.MUTUAL_ATTESTATION_PROTOCOL_VERSION
     ):
-      raise ValueError(
+      raise attestation_protocol.AttestationRequestError(
           "Unsupported mutual attestation protocol version:"
           f" {request.protocol_version}"
       )
     if self._client_policy is None:
-      raise ValueError("Server is not configured to verify client evidence.")
+      raise attestation_protocol.AttestationRequestError(
+          "Server is not configured to verify client evidence."
+      )
     # The EKM is the only freshness in this mode, and only a TLS 1.3 exporter
     # is guaranteed unique to the session. Check before any proof is verified
     # or produced, so a TLS 1.2 session gets no server proof.
     tls_version = ssl_obj.version()
     if tls_version != attestation_protocol.MUTUAL_ATTESTATION_TLS_VERSION:
-      raise ValueError(
+      raise attestation_protocol.AttestationRequestError(
           "Mutual attestation requires"
           f" {attestation_protocol.MUTUAL_ATTESTATION_TLS_VERSION}, but the"
           f" session uses {tls_version}."
@@ -338,9 +345,13 @@ class AttestedTLS:
     if request.nonce:
       # Mutual mode binds to the bare session EKM. Honoring a caller-supplied
       # context here would let the peers derive different bindings.
-      raise ValueError("nonce must be empty for mutual attestation.")
+      raise attestation_protocol.AttestationRequestError(
+          "nonce must be empty for mutual attestation."
+      )
     if not request.HasField("client_attestation"):
-      raise ValueError("Client attestation proof is missing.")
+      raise attestation_protocol.AttestationRequestError(
+          "Client attestation proof is missing."
+      )
 
     tls_ekm = _export_ekm(ssl_obj, context=None)
     claims = self._client_verifier().validate_proof(

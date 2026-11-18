@@ -16,18 +16,25 @@
 
 import http
 import json
+import math
 import ssl
+import time
 from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from prompt_encryption_sdk import attestation as attestation_protocol
+from prompt_encryption_sdk.client import exceptions
 from prompt_encryption_sdk.proto import attestation_pb2
 from prompt_encryption_sdk.server import attestation
 from prompt_encryption_sdk.server import keys
 from prompt_encryption_sdk.server import token
 from prompt_encryption_sdk.server import wsgi
 from google.protobuf import json_format
+from gunicorn import config as gunicorn_config
+from gunicorn.http import wsgi as gunicorn_wsgi
 import werkzeug.test
+
 
 class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
 
@@ -41,7 +48,9 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
       pass
 
     self.app = mock.create_autospec(simple_app)
-    self.mw = wsgi.PromptEncryptionWSGIMiddleware(self.app, self.mock_attested_tls)
+    self.mw = wsgi.PromptEncryptionWSGIMiddleware(
+        self.app, self.mock_attested_tls
+    )
     self.client = werkzeug.test.Client(self.mw)
 
   def test_call_other_path_attested(self):
@@ -51,7 +60,7 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
 
     self.app.side_effect = simple_app
     mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
-    self.mw._attested_sockets.add(mock_socket)
+    self.mw._attested_sockets[mock_socket] = math.inf
     environ_overrides = {"prompt_encryption.socket": mock_socket}
 
     response = self.client.get("/other", environ_overrides=environ_overrides)
@@ -74,6 +83,7 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
         json.loads(response.data),
         {"error": "Unauthorized: Connection must be attested first."},
     )
+    self.assertIsNone(response.headers.get("Connection"))
     self.app.assert_not_called()
 
   def test_call_other_path_missing_socket(self):
@@ -132,6 +142,182 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
         self.mw._attested_sockets,
     )
 
+  def test_replayed_attestation_drops_the_connection(self):
+    """A mutually attested session may not attest again; it is dropped."""
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    self.mw._attested_sockets[mock_socket] = math.inf
+    self.mock_attested_tls.attest_connection.side_effect = (
+        attestation_protocol.AttestationReplayError("already attested")
+    )
+
+    response = self.client.post(
+        "/_attest-connection",
+        json={},
+        environ_overrides={"prompt_encryption.socket": mock_socket},
+    )
+
+    with self.subTest("Forbidden"):
+      self.assertEqual(response.status_code, http.HTTPStatus.FORBIDDEN)
+      self.assertIn(b"already attested", response.data)
+    with self.subTest("ConnectionClosed"):
+      self.assertEqual(response.headers.get("Connection"), "close")
+    with self.subTest("AuthorizationRevoked"):
+      self.assertNotIn(mock_socket, self.mw._attested_sockets)
+
+  def test_application_traffic_is_refused_after_a_replay_drop(self):
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    self.mw._attested_sockets[mock_socket] = math.inf
+    self.mock_attested_tls.attest_connection.side_effect = (
+        attestation_protocol.AttestationReplayError("already attested")
+    )
+    environ_overrides = {"prompt_encryption.socket": mock_socket}
+    self.client.post(
+        "/_attest-connection", json={}, environ_overrides=environ_overrides
+    )
+
+    response = self.client.get("/infer", environ_overrides=environ_overrides)
+
+    self.assertEqual(response.status_code, http.HTTPStatus.UNAUTHORIZED)
+    self.app.assert_not_called()
+
+  def _attest(self, mock_socket, expires_at):
+    """Runs a successful attestation that yields the given expiry."""
+    self.mock_attested_tls.attest_connection.return_value = (
+        attestation.AttestationResult(
+            response=attestation_pb2.AttestConnectionResponse(),
+            expires_at=expires_at,
+        )
+    )
+    return self.client.post(
+        "/_attest-connection",
+        json={},
+        environ_overrides={"prompt_encryption.socket": mock_socket},
+    )
+
+  def test_a_mutual_session_inherits_the_client_token_expiry(self):
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    expiry = time.time() + 300
+
+    self._attest(mock_socket, expiry)
+
+    self.assertEqual(self.mw._attested_sockets[mock_socket], expiry)
+
+  def test_mutual_attestation_replaces_server_only_infinite_expiry(self):
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    self._attest(mock_socket, math.inf)
+    expiry = time.time() + 300
+
+    self._attest(mock_socket, expiry)
+
+    self.assertEqual(self.mw._attested_sockets[mock_socket], expiry)
+
+  def test_traffic_is_served_before_the_attestation_expires(self):
+    def simple_app(_, start_response):
+      start_response("200 OK", [("Content-Type", "text/plain")])
+      return [b"ok"]
+
+    self.app.side_effect = simple_app
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    self._attest(mock_socket, time.time() + 300)
+
+    response = self.client.get(
+        "/infer",
+        environ_overrides={"prompt_encryption.socket": mock_socket},
+    )
+
+    self.assertEqual(response.status_code, http.HTTPStatus.OK)
+    self.app.assert_called_once()
+
+  def test_traffic_is_refused_once_the_attestation_expires(self):
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    expiry = 1_700_000_000.0
+    self._attest(mock_socket, expiry)
+
+    # Exactly at the expiry time counts as expired.
+    with mock.patch.object(
+        wsgi.time, "time", autospec=True, return_value=expiry
+    ):
+      response = self.client.get(
+          "/infer",
+          environ_overrides={"prompt_encryption.socket": mock_socket},
+      )
+
+    with self.subTest("Unauthorized"):
+      self.assertEqual(response.status_code, http.HTTPStatus.UNAUTHORIZED)
+      self.assertEqual(
+          json.loads(response.data),
+          {"error": "Unauthorized: Attestation expired."},
+      )
+      self.app.assert_not_called()
+    with self.subTest("ConnectionClosed"):
+      self.assertEqual(response.headers.get("Connection"), "close")
+    with self.subTest("AuthorizationDropped"):
+      self.assertNotIn(mock_socket, self.mw._attested_sockets)
+
+  def test_a_request_admitted_before_expiry_runs_to_completion(self):
+    """Expiry is checked at request entry, so nothing is cut off mid-flight."""
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    expiry = 1_700_000_000.0
+    self._attest(mock_socket, expiry)
+
+    with mock.patch.object(
+        wsgi.time, "time", autospec=True, return_value=expiry - 1
+    ) as mock_time:
+
+      def slow_app(_, start_response):
+        # The clock passes the expiry while the request runs.
+        mock_time.return_value = expiry + 1
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"ok"]
+
+      self.app.side_effect = slow_app
+      response = self.client.get(
+          "/infer",
+          environ_overrides={"prompt_encryption.socket": mock_socket},
+      )
+
+    self.assertEqual(response.status_code, http.HTTPStatus.OK)
+    self.assertIn(mock_socket, self.mw._attested_sockets)
+
+  def test_gunicorn_closes_the_connection_when_the_attestation_expires(self):
+    """gunicorn drops a Connection header, so the middleware forces the close."""
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    self._attest(mock_socket, 1_700_000_000.0)
+    request = mock.Mock(version=(1, 1), method="GET")
+    request.should_close.return_value = False
+    gunicorn_response = gunicorn_wsgi.Response(
+        request, mock.Mock(), gunicorn_config.Config()
+    )
+
+    with mock.patch.object(
+        wsgi.time, "time", autospec=True, return_value=1_700_000_001.0
+    ):
+      self.mw(
+          {
+              "PATH_INFO": "/infer",
+              "prompt_encryption.socket": mock_socket,
+              wsgi._FORCE_CLOSE_KEY: gunicorn_response.force_close,
+          },
+          gunicorn_response.start_response,
+      )
+
+    self.assertEqual(gunicorn_response.status_code, 401)
+    self.assertTrue(gunicorn_response.should_close())
+    self.assertIn("Connection: close\r\n", gunicorn_response.default_headers())
+
+  def test_patched_gunicorn_create_exposes_force_close(self):
+    request = mock.Mock(spec=["confidential_socket"])
+    gunicorn_response = mock.Mock(spec=["force_close"])
+    with mock.patch.object(
+        wsgi, "_original_create", return_value=(gunicorn_response, {})
+    ):
+      _, environ = wsgi._patched_wsgi_create(request)
+
+    self.assertIs(
+        environ["prompt_encryption.socket"], request.confidential_socket
+    )
+    self.assertIs(environ[wsgi._FORCE_CLOSE_KEY], gunicorn_response.force_close)
+
   @parameterized.named_parameters(
       dict(
           testcase_name="missing_socket",
@@ -139,7 +325,8 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
           environ_overrides=None,
           mock_error=None,
           expected_status=http.HTTPStatus.INTERNAL_SERVER_ERROR,
-          expected_error_substring=b"TLS Socket not found",
+          expected_error="Internal server error.",
+          forbidden_substring=b"TLS Socket",
       ),
       dict(
           testcase_name="parse_error",
@@ -147,7 +334,8 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
           environ_overrides=None,
           mock_error=None,
           expected_status=http.HTTPStatus.BAD_REQUEST,
-          expected_error_substring=b"Invalid request",
+          expected_error="Invalid request",
+          forbidden_substring=b"ParseError",
       ),
       dict(
           testcase_name="malformed_json_list",
@@ -155,19 +343,63 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
           environ_overrides=None,
           mock_error=None,
           expected_status=http.HTTPStatus.BAD_REQUEST,
-          expected_error_substring=b"Invalid request",
+          expected_error="Invalid request",
+          forbidden_substring=b"Malformed",
       ),
       dict(
           testcase_name="internal_error",
           json_body={},
           environ_overrides={"prompt_encryption.socket": "mock_socket"},
-          mock_error=ValueError("test error"),
+          mock_error=ValueError("secret-value-error"),
           expected_status=http.HTTPStatus.INTERNAL_SERVER_ERROR,
-          expected_error_substring=b"test error",
+          expected_error="Internal server error.",
+          forbidden_substring=b"secret-value-error",
+      ),
+      dict(
+          testcase_name="runtime_error",
+          json_body={},
+          environ_overrides={"prompt_encryption.socket": "mock_socket"},
+          mock_error=RuntimeError("secret-runtime-fault"),
+          expected_status=http.HTTPStatus.INTERNAL_SERVER_ERROR,
+          expected_error="Internal server error.",
+          forbidden_substring=b"secret-runtime-fault",
+      ),
+      dict(
+          testcase_name="permission_error",
+          json_body={},
+          environ_overrides={"prompt_encryption.socket": "mock_socket"},
+          mock_error=PermissionError("secret-token-path"),
+          expected_status=http.HTTPStatus.INTERNAL_SERVER_ERROR,
+          expected_error="Internal server error.",
+          forbidden_substring=b"secret-token-path",
+      ),
+      dict(
+          testcase_name="policy_violation_error",
+          json_body={},
+          environ_overrides={"prompt_encryption.socket": "mock_socket"},
+          mock_error=exceptions.PolicyViolationError("untrusted client"),
+          expected_status=http.HTTPStatus.FORBIDDEN,
+          expected_error="Client attestation failed.",
+          forbidden_substring=b"untrusted client",
+      ),
+      dict(
+          testcase_name="attestation_verification_error",
+          json_body={},
+          environ_overrides={"prompt_encryption.socket": "mock_socket"},
+          mock_error=exceptions.AttestationVerificationError("bad signature"),
+          expected_status=http.HTTPStatus.FORBIDDEN,
+          expected_error="Client attestation failed.",
+          forbidden_substring=b"bad signature",
       ),
   )
   def test_handle_attestation_errors(
-      self, json_body, environ_overrides, mock_error, expected_status, expected_error_substring
+      self,
+      json_body,
+      environ_overrides,
+      mock_error,
+      expected_status,
+      expected_error,
+      forbidden_substring,
   ):
     if mock_error:
       self.mock_attested_tls.attest_connection.side_effect = mock_error
@@ -184,7 +416,129 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
     response = self.client.post("/_attest-connection", **kwargs)
 
     self.assertEqual(response.status_code, expected_status)
-    self.assertIn(expected_error_substring, response.data)
+    self.assertEqual(json.loads(response.data), {"error": expected_error})
+    self.assertNotIn(forbidden_substring, response.data)
+    self.assertIsNone(response.headers.get("Connection"))
+
+  def test_invalid_utf8_body_returns_bad_request(self):
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+
+    response = self.client.post(
+        "/_attest-connection",
+        data=b"\x80abc",
+        content_type="application/json",
+        environ_overrides={"prompt_encryption.socket": mock_socket},
+    )
+
+    self.mock_attested_tls.attest_connection.assert_not_called()
+    self.assertEqual(response.status_code, http.HTTPStatus.BAD_REQUEST)
+    self.assertEqual(json.loads(response.data), {"error": "Invalid request"})
+    self.assertNotIn(b"UnicodeDecodeError", response.data)
+    self.assertIsNone(response.headers.get("Connection"))
+
+  def test_server_only_request_to_require_mutual_server_returns_sanitized_400(
+      self,
+  ):
+    attested_tls = attestation.AttestedTLS(
+        mock.create_autospec(token.TokenManager, instance=True),
+        client_policy=attestation_pb2.AttestationPolicy(
+            gce_instance=attestation_pb2.GceInstancePolicy(project_id="trusted")
+        ),
+        require_mutual_attestation=True,
+    )
+    mw = wsgi.PromptEncryptionWSGIMiddleware(self.app, attested_tls)
+    client = werkzeug.test.Client(mw)
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    request_proto = attestation_pb2.AttestConnectionRequest(
+        required_verifier_type=[attestation_pb2.VerifierType.VERIFIER_TYPE_GCA],
+        nonce=b"n" * 32,
+    )
+
+    with self.assertLogs(level="WARNING") as logs:
+      response = client.post(
+          "/_attest-connection",
+          data=json_format.MessageToJson(request_proto),
+          content_type="application/json",
+          environ_overrides={"prompt_encryption.socket": mock_socket},
+      )
+
+    self.assertEqual(response.status_code, http.HTTPStatus.BAD_REQUEST)
+    self.assertEqual(
+        json.loads(response.data), {"error": "Invalid attestation request."}
+    )
+    self.assertNotIn(b"requires mutual attestation", response.data)
+    self.assertIsNone(response.headers.get("Connection"))
+    self.assertNotIn(mock_socket, mw._attested_sockets)
+    self.assertTrue(
+        any(
+            "This server requires mutual attestation." in line
+            for line in logs.output
+        )
+    )
+
+  def test_internal_error_logs_detail_without_leaking_it(self):
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+    self.mock_attested_tls.attest_connection.side_effect = RuntimeError(
+        "secret-runtime-fault"
+    )
+
+    with self.assertLogs(level="ERROR") as logs:
+      response = self.client.post(
+          "/_attest-connection",
+          json={},
+          environ_overrides={"prompt_encryption.socket": mock_socket},
+      )
+
+    self.assertEqual(
+        response.status_code, http.HTTPStatus.INTERNAL_SERVER_ERROR
+    )
+    self.assertEqual(
+        json.loads(response.data), {"error": "Internal server error."}
+    )
+    self.assertNotIn(b"secret-runtime-fault", response.data)
+    self.assertTrue(any("secret-runtime-fault" in line for line in logs.output))
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="policy_violation_error",
+          error_cls=exceptions.PolicyViolationError,
+          secret=b"secret-policy-detail",
+      ),
+      dict(
+          testcase_name="attestation_verification_error",
+          error_cls=exceptions.AttestationVerificationError,
+          secret=b"secret-verify-detail",
+      ),
+  )
+  def test_client_attestation_failure_logs_detail_without_leaking_it(
+      self, error_cls, secret
+  ):
+    mock_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+
+    def raise_chained(*unused_args, **unused_kwargs):
+      raise error_cls(secret.decode("utf-8")) from RuntimeError(
+          "jwks-cause-detail"
+      )
+
+    self.mock_attested_tls.attest_connection.side_effect = raise_chained
+
+    with self.assertLogs(level="WARNING") as logs:
+      response = self.client.post(
+          "/_attest-connection",
+          json={},
+          environ_overrides={"prompt_encryption.socket": mock_socket},
+      )
+
+    self.assertEqual(response.status_code, http.HTTPStatus.FORBIDDEN)
+    self.assertEqual(
+        json.loads(response.data), {"error": "Client attestation failed."}
+    )
+    self.assertNotIn(secret, response.data)
+    self.assertNotIn(b"jwks-cause-detail", response.data)
+    self.assertIsNone(response.headers.get("Connection"))
+    self.assertNotIn(mock_socket, self.mw._attested_sockets)
+    self.assertTrue(any(secret.decode("utf-8") in line for line in logs.output))
+    self.assertTrue(any("jwks-cause-detail" in line for line in logs.output))
 
   def test_run_gunicorn_app(self):
     mock_app = mock.Mock()
@@ -209,7 +563,11 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
     )
 
     with self.subTest("AttestedTLS"):
-      mock_attested_tls_cls.assert_called_once_with(mock_token_manager)
+      mock_attested_tls_cls.assert_called_once_with(
+          mock_token_manager,
+          client_policy=None,
+          require_mutual_attestation=False,
+      )
 
     with self.subTest("StandaloneApplication"):
       mock_standalone_app_cls.assert_called_once_with(
@@ -225,6 +583,50 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
           },
       )
       mock_standalone_app_instance.run.assert_called_once()
+
+  def test_run_gunicorn_app_rejects_invalid_mutual_settings_before_start(
+      self,
+  ):
+    mock_token_manager = mock.create_autospec(token.TokenManager, instance=True)
+    mock_standalone_app_cls = mock.create_autospec(
+        wsgi._StandaloneApplication, instance=False
+    )
+
+    with self.assertRaisesRegex(ValueError, "client_policy is required"):
+      wsgi.run_gunicorn_app(
+          mock.Mock(),
+          key_manager=mock.create_autospec(keys.KeyManager, instance=True),
+          token_manager=mock_token_manager,
+          require_mutual_attestation=True,
+          standalone_app_cls=mock_standalone_app_cls,
+      )
+
+    mock_token_manager.__enter__.assert_not_called()
+    mock_standalone_app_cls.assert_not_called()
+
+  def test_run_gunicorn_app_forwards_the_mutual_configuration(self):
+    mock_token_manager = mock.create_autospec(token.TokenManager, instance=True)
+    mock_attested_tls_cls = mock.create_autospec(
+        attestation.AttestedTLS, instance=False
+    )
+    client_policy = attestation_pb2.AttestationPolicy(expected_audience="aud")
+
+    wsgi.run_gunicorn_app(
+        mock.Mock(),
+        token_manager=mock_token_manager,
+        client_policy=client_policy,
+        require_mutual_attestation=True,
+        attested_tls_cls=mock_attested_tls_cls,
+        standalone_app_cls=mock.create_autospec(
+            wsgi._StandaloneApplication, instance=False
+        ),
+    )
+
+    mock_attested_tls_cls.assert_called_once_with(
+        mock_token_manager,
+        client_policy=client_policy,
+        require_mutual_attestation=True,
+    )
 
   def test_middleware_repr(self):
     self.assertEqual(

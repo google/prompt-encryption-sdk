@@ -34,18 +34,25 @@ class ValidateRequiredVerifiersTest(parameterized.TestCase):
 
   def test_rejects_empty(self):
     with self.assertRaisesRegex(
-        ValueError, "At least one required_verifier_type must be specified."
+        attestation_protocol.AttestationRequestError,
+        "At least one required_verifier_type must be specified.",
     ):
       attestation_protocol.validate_required_verifiers([])
 
   def test_rejects_unsupported(self):
-    with self.assertRaisesRegex(ValueError, "Unsupported verifier types"):
+    with self.assertRaisesRegex(
+        attestation_protocol.AttestationRequestError,
+        "Unsupported verifier types",
+    ):
       attestation_protocol.validate_required_verifiers(
           [attestation_pb2.VERIFIER_TYPE_UNSPECIFIED]
       )
 
   def test_rejects_unsupported_mixed_with_supported(self):
-    with self.assertRaisesRegex(ValueError, "Unsupported verifier types"):
+    with self.assertRaisesRegex(
+        attestation_protocol.AttestationRequestError,
+        "Unsupported verifier types",
+    ):
       attestation_protocol.validate_required_verifiers([
           attestation_pb2.VERIFIER_TYPE_GCA,
           attestation_pb2.VERIFIER_TYPE_UNSPECIFIED,

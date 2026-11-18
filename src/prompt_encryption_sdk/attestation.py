@@ -58,6 +58,10 @@ class AttestationReplayError(Exception):
   """
 
 
+class AttestationRequestError(ValueError):
+  """The peer sent an invalid attestation request."""
+
+
 class SigningKeyManager(Protocol):
   """The subset of KeyManager used to produce channel-bound proofs."""
 
@@ -98,15 +102,17 @@ def validate_required_verifiers(
     verifier_types: The `required_verifier_type` values from a request.
 
   Raises:
-    ValueError: If no verifier is requested or any is not GCA.
+    AttestationRequestError: If no verifier is requested or any is not GCA.
   """
   if not verifier_types:
-    raise ValueError("At least one required_verifier_type must be specified.")
+    raise AttestationRequestError(
+        "At least one required_verifier_type must be specified."
+    )
   if any(
       verifier_type != attestation_pb2.VERIFIER_TYPE_GCA
       for verifier_type in verifier_types
   ):
-    raise ValueError(
+    raise AttestationRequestError(
         f"Unsupported verifier types requested: {list(verifier_types)}"
     )
 

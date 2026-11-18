@@ -260,7 +260,9 @@ class MutualAttestationTest(parameterized.TestCase):
         tls_version=mutual_testlib.TLS_1_2
     )
 
-    with self.assertRaisesRegex(ValueError, "requires TLSv1.3"):
+    with self.assertRaisesRegex(
+        attestation_protocol.AttestationRequestError, "requires TLSv1.3"
+    ):
       self._attest()
 
 

@@ -133,7 +133,8 @@ class AttestedTlsImplTest(absltest.TestCase):
     )
     request = attestation_pb2.AttestConnectionRequest()
     with self.assertRaisesRegex(
-        ValueError, "At least one required_verifier_type must be specified."
+        attestation_protocol.AttestationRequestError,
+        "At least one required_verifier_type must be specified.",
     ):
       attested_tls_instance.attest_connection(request, ssl_obj=mock.MagicMock())
 
@@ -159,7 +160,8 @@ class AttestedTlsImplTest(absltest.TestCase):
         ]
     )
     with self.assertRaisesRegex(
-        ValueError, "Unsupported verifier types requested:"
+        attestation_protocol.AttestationRequestError,
+        "Unsupported verifier types requested:",
     ):
       attested_tls_instance.attest_connection(request, ssl_obj=mock_ssl_obj)
 
@@ -186,7 +188,8 @@ class AttestedTlsImplTest(absltest.TestCase):
         ]
     )
     with self.assertRaisesRegex(
-        ValueError, "Unsupported verifier types requested:"
+        attestation_protocol.AttestationRequestError,
+        "Unsupported verifier types requested:",
     ):
       attested_tls_instance.attest_connection(request, ssl_obj=mock_ssl_obj)
 
@@ -335,7 +338,9 @@ class MutualAttestedTlsTest(parameterized.TestCase):
     self.ssl_obj.version.return_value = tls_version
     attested_tls = self._attested_tls()
 
-    with self.assertRaisesRegex(ValueError, "requires TLSv1.3"):
+    with self.assertRaisesRegex(
+        attestation_protocol.AttestationRequestError, "requires TLSv1.3"
+    ):
       attested_tls.attest_connection(_mutual_request(), ssl_obj=self.ssl_obj)
 
     with self.subTest("ClientProofNotVerified"):
@@ -449,7 +454,8 @@ class MutualAttestedTlsTest(parameterized.TestCase):
     request.ClearField("client_attestation")
 
     with self.assertRaisesRegex(
-        ValueError, "Client attestation proof is missing."
+        attestation_protocol.AttestationRequestError,
+        "Client attestation proof is missing.",
     ):
       attested_tls.attest_connection(request, ssl_obj=self.ssl_obj)
 
@@ -457,7 +463,9 @@ class MutualAttestedTlsTest(parameterized.TestCase):
     """A caller-chosen EKM context would let the peers derive different keys."""
     attested_tls = self._attested_tls()
 
-    with self.assertRaisesRegex(ValueError, "nonce must be empty"):
+    with self.assertRaisesRegex(
+        attestation_protocol.AttestationRequestError, "nonce must be empty"
+    ):
       attested_tls.attest_connection(
           _mutual_request(nonce=b"n" * 32), ssl_obj=self.ssl_obj
       )
@@ -467,7 +475,8 @@ class MutualAttestedTlsTest(parameterized.TestCase):
     attested_tls = self._attested_tls()
 
     with self.assertRaisesRegex(
-        ValueError, "Unsupported mutual attestation protocol version"
+        attestation_protocol.AttestationRequestError,
+        "Unsupported mutual attestation protocol version",
     ):
       attested_tls.attest_connection(
           _mutual_request(protocol_version=protocol_version),
@@ -482,7 +491,8 @@ class MutualAttestedTlsTest(parameterized.TestCase):
     attested_tls = self._attested_tls()
 
     with self.assertRaisesRegex(
-        ValueError, "Unsupported server-only protocol version"
+        attestation_protocol.AttestationRequestError,
+        "Unsupported server-only protocol version",
     ):
       attested_tls.attest_connection(
           attestation_pb2.AttestConnectionRequest(
@@ -593,7 +603,8 @@ class MutualAttestedTlsTest(parameterized.TestCase):
     attested_tls = attestation.AttestedTLS(self.token_manager)
 
     with self.assertRaisesRegex(
-        ValueError, "not configured to verify client evidence"
+        attestation_protocol.AttestationRequestError,
+        "not configured to verify client evidence",
     ):
       attested_tls.attest_connection(_mutual_request(), ssl_obj=self.ssl_obj)
 
@@ -601,7 +612,8 @@ class MutualAttestedTlsTest(parameterized.TestCase):
     attested_tls = self._attested_tls(require_mutual_attestation=True)
 
     with self.assertRaisesRegex(
-        ValueError, "This server requires mutual attestation."
+        attestation_protocol.AttestationRequestError,
+        "This server requires mutual attestation.",
     ):
       attested_tls.attest_connection(
           attestation_pb2.AttestConnectionRequest(
@@ -637,7 +649,8 @@ class MutualAttestedTlsTest(parameterized.TestCase):
     attested_tls = self._attested_tls()
 
     with self.assertRaisesRegex(
-        ValueError, "client_attestation is valid only for mutual attestation."
+        attestation_protocol.AttestationRequestError,
+        "client_attestation is valid only for mutual attestation.",
     ):
       attested_tls.attest_connection(
           attestation_pb2.AttestConnectionRequest(
@@ -652,7 +665,10 @@ class MutualAttestedTlsTest(parameterized.TestCase):
   def test_unknown_mode_is_rejected(self):
     attested_tls = self._attested_tls()
 
-    with self.assertRaisesRegex(ValueError, "Unsupported attestation mode"):
+    with self.assertRaisesRegex(
+        attestation_protocol.AttestationRequestError,
+        "Unsupported attestation mode",
+    ):
       attested_tls.attest_connection(
           _mutual_request(mode=99), ssl_obj=self.ssl_obj
       )
