@@ -155,7 +155,9 @@ class MiddlewareTest(parameterized.TestCase):
               key_bytes=b"test_public_key"
           )
       )
-      self.mock_attested_tls.attest_connection.return_value = response_proto
+      self.mock_attested_tls.attest_connection.return_value = (
+          attestation.AttestationResult(response=response_proto)
+      )
 
       await self.mw(scope, receive, self.send)
 
@@ -207,7 +209,9 @@ class MiddlewareTest(parameterized.TestCase):
               key_bytes=b"test_public_key"
           )
       )
-      self.mock_attested_tls.attest_connection.return_value = response_proto
+      self.mock_attested_tls.attest_connection.return_value = (
+          attestation.AttestationResult(response=response_proto)
+      )
 
       await self.mw(scope, receive, self.send)
 

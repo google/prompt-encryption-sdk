@@ -22,7 +22,10 @@ puts its own proof in the response.
 In mutual mode, neither side contributes a nonce. The TLS 1.3 Exported Keying
 Material (RFC 5705, RFC 8446 section 7.5) is already unique to the session -- it
 is derived from both peers' handshake randoms and the ephemeral key exchange --
-so it *is* the freshness challenge.
+so it *is* the freshness challenge. Both peers therefore require TLS 1.3; see
+`MUTUAL_ATTESTATION_TLS_VERSION`. The consequence is that the binding is
+constant for the lifetime of the session, which is why a session is attested
+exactly once; see `AttestationReplayError`.
 """
 
 from collections.abc import Sequence
@@ -37,6 +40,22 @@ MUTUAL_ATTESTATION_PROTOCOL_VERSION: int = 1
 # TLS Exported Keying Material (RFC 5705) parameters.
 EKM_LABEL: bytes = b"EXPORTER-Prompt-Encryption-SDK"
 EKM_LENGTH: int = 32
+
+# The only TLS version, as `ssl.SSLSocket.version()` reports it, over which
+# either peer runs the mutual exchange. Mutual mode has no nonce, so the EKM is
+# its only freshness. A TLS 1.3 exporter is unique to the session. A TLS 1.2
+# exporter is not, unless both peers use the extended master secret (RFC 7627),
+# and Python cannot check that.
+MUTUAL_ATTESTATION_TLS_VERSION: str = "TLSv1.3"
+
+
+class AttestationReplayError(Exception):
+  """Raised when a TLS session that already attested attests again.
+
+  Because the signed binding is the session's EKM, a second exchange over the
+  same session would re-sign the identical payload and prove nothing new. The
+  connection is dropped rather than re-attested.
+  """
 
 
 class SigningKeyManager(Protocol):

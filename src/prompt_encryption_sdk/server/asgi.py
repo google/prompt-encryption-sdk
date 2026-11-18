@@ -139,13 +139,9 @@ class PromptEncryptionASGIMiddleware:
     if not ssl_obj:
       raise RuntimeError("TLS Socket not found.")
 
-    attestation_response_proto = self.attested_tls.attest_connection(
-        req, ssl_obj=ssl_obj
-    )
+    result = self.attested_tls.attest_connection(req, ssl_obj=ssl_obj)
     self._attested_sockets.add(ssl_obj)
-    attestation_response_dict = json_format.MessageToDict(
-        attestation_response_proto
-    )
+    attestation_response_dict = json_format.MessageToDict(result.response)
     response = responses.JSONResponse(attestation_response_dict)
     await response(scope, receive, send)
 

@@ -100,7 +100,9 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
             key_bytes=b"test_public_key"
         )
     )
-    self.mock_attested_tls.attest_connection.return_value = response_proto
+    self.mock_attested_tls.attest_connection.return_value = (
+        attestation.AttestationResult(response=response_proto)
+    )
 
     # Mock the socket injection in environ
     environ_overrides = {
@@ -336,7 +338,9 @@ class PromptEncryptionWSGIMiddlewareTest(parameterized.TestCase):
           )
       }
       self.mock_attested_tls.attest_connection.return_value = (
-          attestation_pb2.AttestConnectionResponse()
+          attestation.AttestationResult(
+              response=attestation_pb2.AttestConnectionResponse()
+          )
       )
 
       response = self.client.post(

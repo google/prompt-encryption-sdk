@@ -149,13 +149,9 @@ class PromptEncryptionWSGIMiddleware:
             " run_gunicorn_app()"
         )
 
-      attestation_response_proto = self.attested_tls.attest_connection(
-          req, ssl_obj=ssl_obj
-      )
+      result = self.attested_tls.attest_connection(req, ssl_obj=ssl_obj)
       self._attested_sockets.add(ssl_obj)
-      attestation_response_dict = json_format.MessageToDict(
-          attestation_response_proto
-      )
+      attestation_response_dict = json_format.MessageToDict(result.response)
 
       response_data = json.dumps(attestation_response_dict).encode("utf-8")
 
