@@ -5,6 +5,9 @@ process. The server has the real WSGI or ASGI middleware. The tests use only
 localhost and temporary files. A fake Google Cloud Attestation (GCA) token
 issuer is the only fake. For details, see `tls_testlib.py`.
 
+`closed_connection_tls_integration_test.py` checks that a client connection
+that was closed connects and attests again when it sends the next request.
+
 These tests protect the existing server-only mode from regressions:
 
 -   `server_only_tls_integration_test.py`: attestation, re-attestation, and

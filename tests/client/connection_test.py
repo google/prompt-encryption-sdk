@@ -308,6 +308,100 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
     ):
       self.conn._perform_attestation_handshake()
 
+  @mock.patch.object(HTTPSConnection, "request", autospec=True)
+  def test_request_on_a_closed_connection_connects_first(
+      self, mock_super_request
+  ):
+    """A closed connection attests before the request starts, not inside it."""
+    self.conn.sock = None
+    calls = []
+    mock_super_request.side_effect = lambda *args, **kwargs: calls.append(
+        "request"
+    )
+
+    with mock.patch.object(
+        self.conn,
+        "connect",
+        autospec=True,
+        side_effect=lambda: calls.append("connect"),
+    ):
+      self.conn.request("GET", "/api/data")
+
+    self.assertEqual(calls, ["connect", "request"])
+
+  @mock.patch.object(HTTPSConnection, "request", autospec=True)
+  def test_request_does_not_revalidate_a_connection_it_just_connected(
+      self, mock_super_request
+  ):
+    """The attestation of connect() is fresh, so it is not repeated."""
+    self.conn.sock = None
+    self.conn._revalidation_timeout = datetime.timedelta(seconds=0)
+    self.conn._last_attestation_time = time.time() - 200
+
+    def connect():
+      self.conn.is_attested = True
+
+    with (
+        mock.patch.object(
+            self.conn, "connect", autospec=True, side_effect=connect
+        ),
+        mock.patch.object(
+            self.conn, "revalidate_session", autospec=True
+        ) as mock_revalidate,
+    ):
+      self.conn.request("GET", "/api/data")
+
+    mock_revalidate.assert_not_called()
+    mock_super_request.assert_called_once()
+
+  @mock.patch.object(HTTPSConnection, "connect", autospec=True)
+  def test_connect_closes_the_socket_when_tls_fails(self, mock_super_connect):
+    """A failed TLS handshake leaves no plain TCP socket behind."""
+    tcp_socket = mock.create_autospec(socket.socket, instance=True)
+
+    def connect_tcp_then_fail(conn):
+      conn.sock = tcp_socket
+      raise ssl.SSLError("handshake failed")
+
+    mock_super_connect.side_effect = connect_tcp_then_fail
+    self.conn.sock = None
+
+    with self.assertRaisesRegex(ssl.SSLError, "handshake failed"):
+      self.conn.connect()
+
+    tcp_socket.close.assert_called_once()
+    self.assertIsNone(self.conn.sock)
+    self.assertFalse(self.conn.is_attested)
+
+  @mock.patch.object(HTTPSConnection, "connect", autospec=True)
+  def test_connect_closes_the_socket_when_interrupted(self, mock_super_connect):
+    """An interrupted connect leaves no unattested socket behind."""
+    tcp_socket = mock.create_autospec(socket.socket, instance=True)
+
+    def connect_tcp_then_interrupt(conn):
+      conn.sock = tcp_socket
+      raise KeyboardInterrupt("interrupted")
+
+    mock_super_connect.side_effect = connect_tcp_then_interrupt
+    self.conn.sock = None
+
+    with self.assertRaisesRegex(KeyboardInterrupt, "interrupted"):
+      self.conn.connect()
+
+    tcp_socket.close.assert_called_once()
+    self.assertIsNone(self.conn.sock)
+    self.assertFalse(self.conn.is_attested)
+
+  @mock.patch.object(HTTPSConnection, "close", autospec=True)
+  def test_close_resets_is_attested(self, mock_super_close):
+    """A closed connection must attest again before it sends a request."""
+    self.conn.is_attested = True
+
+    self.conn.close()
+
+    mock_super_close.assert_called_once_with(self.conn)
+    self.assertFalse(self.conn.is_attested)
+
 
 class AttestedHTTPSConnectionPoolTest(absltest.TestCase):
 

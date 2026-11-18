@@ -175,21 +175,24 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
 
   def connect(self) -> None:
     """Establishes the TLS connection and performs attestation."""
-    # 1. Standard TLS Connection (Creates self.sock)
-    super().connect()
-
-    # 2. Post-Handshake Attestation
     try:
+      # 1. Standard TLS Connection (Creates self.sock)
+      super().connect()
+
+      # 2. Post-Handshake Attestation
       self._perform_attestation_handshake()
-    except Exception:
+    except BaseException:
+      # A failed TLS handshake can leave the plain TCP socket in self.sock.
+      # Close it, so that the next request connects again.
       self.close()
       raise
     else:
       self.is_attested = True
 
   def request(self, method, url, body=None, headers=None, **kwargs) -> None:
-    """Overrides request to perform Lazy Session Revalidation.
+    """Overrides request to connect if closed and to revalidate if stale.
 
+    A closed connection connects, and so attests, before it sends anything.
     Using **kwargs ensures compatibility with different versions of
     urllib3/requests
     that might pass 'chunked', 'encode_chunked', or other arguments.
@@ -203,11 +206,20 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
         method.
 
     Raises:
-      exceptions.PromptEncryptionError: If session revalidation fails
-        before sending the request.
+      exceptions.PromptEncryptionError: If the attestation of a closed
+        connection fails, or if session revalidation fails before sending the
+        request.
+      urllib3.exceptions.HTTPError: If a closed connection cannot connect
+        again, for example `NewConnectionError`.
+      OSError: If the TLS handshake of a closed connection fails.
     """
-    # Check if we need to revalidate
-    if self.is_attested and self._should_revalidate():
+    # A closed connection connects, and so attests, before it sends. Otherwise
+    # http.client would reconnect inside send(), and the attestation request
+    # would start while this request is half sent. An open connection
+    # revalidates if its attestation is older than the revalidation time.
+    if self.sock is None:
+      self.connect()
+    elif self.is_attested and self._should_revalidate():
       logger.info(
           "Session age exceeds %s. Revalidating...",
           self._revalidation_timeout,
@@ -252,6 +264,13 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
       raise exceptions.AttestationVerificationError(
           "Revalidation failed"
       ) from e
+
+  def close(self) -> None:
+    """Closes the socket and forgets the attestation bound to it."""
+    try:
+      super().close()
+    finally:
+      self.is_attested = False
 
 
 class AttestedHTTPSConnectionPool(connectionpool.HTTPSConnectionPool):
