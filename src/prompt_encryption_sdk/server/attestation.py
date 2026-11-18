@@ -57,7 +57,8 @@ class AttestedTLS:
     Raises:
       ValueError: If no required_verifier_type is specified or if an unsupported
         verifier type is requested.
-      RuntimeError: If EKM extraction fails.
+      RuntimeError: If EKM extraction fails, or if this server has no
+        attestation token yet.
     """
     if not request.required_verifier_type:
       raise ValueError("At least one required_verifier_type must be specified.")
@@ -102,6 +103,8 @@ class AttestedTLS:
     ecdsa_pub, pqc_pub, attestation_token = (
         self.token_manager.get_identity_snapshot()
     )
+    if not attestation_token:
+      raise RuntimeError("Attestation identity has no token.")
     token_hash_bytes = hashlib.sha256(attestation_token).digest()
     ekm_hash_bytes = hashlib.sha256(ekm_bytes).digest()
     payload = attestation_pb2.SessionSignaturePayload(

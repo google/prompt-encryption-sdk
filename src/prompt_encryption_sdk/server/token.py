@@ -193,6 +193,8 @@ class TokenManager:
           [ecdsa_fingerprint, pqc_fingerprint],
           audience=self.audience,
       )
+      if not attestation_token:
+        raise RuntimeError("Attestation service returned an empty token.")
       common.write_file(self.attestation_token_path, attestation_token, 0o644)
     logging.info("Refresh complete.")
 
@@ -282,9 +284,21 @@ class TokenManager:
         time.sleep(DEFAULT_RETRY_INTERVAL_SECONDS)
 
   def __enter__(self) -> "TokenManager":
+    """Fetches the first token, then starts the background refresher.
+
+    Returns:
+      This TokenManager, which has a token.
+
+    Raises:
+      Exception: Any error from the first `refresh()`, for example
+        `RuntimeError` if the attestation service fails. The refresher thread
+        does not start then, so a server that uses this TokenManager does not
+        start either.
+    """
     logging.info("Starting token manager.")
-    self._thread.start()
+    self.refresh()
     self._stop_event.clear()
+    self._thread.start()
     return self
 
   def __exit__(

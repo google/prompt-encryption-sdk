@@ -181,6 +181,34 @@ class AttestedTlsImplTest(absltest.TestCase):
     ):
       attested_tls_instance.attest_connection(request, ssl_obj=mock_ssl_obj)
 
+  def test_attest_connection_without_a_token_fails(self):
+    """A server that has no token yet sends no proof."""
+    mock_key_manager = mock.create_autospec(keys.KeyManager, instance=True)
+    mock_token_manager = mock.create_autospec(token.TokenManager, instance=True)
+    mock_token_manager.key_manager = mock_key_manager
+    mock_token_manager.get_identity_snapshot.return_value = (
+        b"pk",
+        b"pqc_pk",
+        b"",
+    )
+    mock_key_manager.sign_payload.return_value = b"sig"
+    mock_key_manager.sign_payload_mldsa.return_value = b"pqc_sig"
+    mock_ssl_obj = mock.Mock(spec=["export_keying_material"])
+    mock_ssl_obj.export_keying_material.return_value = b"ekm"
+    attested_tls_instance = attestation.AttestedTLS(
+        token_manager=mock_token_manager
+    )
+    request = attestation_pb2.AttestConnectionRequest(
+        required_verifier_type=[attestation_pb2.VerifierType.VERIFIER_TYPE_GCA],
+        nonce=b"test_nonce",
+    )
+
+    with self.assertRaisesRegex(RuntimeError, "no token"):
+      attested_tls_instance.attest_connection(request, ssl_obj=mock_ssl_obj)
+
+    mock_key_manager.sign_payload.assert_not_called()
+    mock_key_manager.sign_payload_mldsa.assert_not_called()
+
 
 if __name__ == "__main__":
   absltest.main()

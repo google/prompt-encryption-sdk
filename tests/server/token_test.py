@@ -410,6 +410,80 @@ class TokenManagerTest(parameterized.TestCase):
           audience=audience,
       )
 
+  @mock.patch.dict(os.environ, {}, clear=True)
+  @mock.patch.object(token, "get_cs_token_bytes", autospec=True)
+  def test_context_manager_refreshes_synchronously_on_enter(
+      self, mock_get_cs_token_bytes
+  ):
+    ecdsa_pub = b"test_ecdsa_public_key"
+    pqc_pub = b"test_pqc_public_keyset"
+    self.mock_key_manager.get_current_public_key.return_value = ecdsa_pub
+    self.mock_key_manager.get_current_pqc_public_key.return_value = pqc_pub
+    mock_get_cs_token_bytes.return_value = b"initial_token"
+
+    token_manager = token.TokenManager(
+        key_manager=self.mock_key_manager,
+        attestation_token_path=self.attestation_token_path,
+        rng=self.seeded_rng,
+    )
+    with mock.patch.object(
+        token_manager, "_thread", autospec=True
+    ) as mock_thread:
+      with token_manager:
+        snapshot = token_manager.get_identity_snapshot()
+        self.assertEqual(snapshot, (ecdsa_pub, pqc_pub, b"initial_token"))
+        mock_thread.start.assert_called_once_with()
+
+  @mock.patch.dict(os.environ, {}, clear=True)
+  @mock.patch.object(token, "get_cs_token_bytes", autospec=True)
+  def test_context_manager_fails_without_a_first_token(
+      self, mock_get_cs_token_bytes
+  ):
+    """If the first refresh fails, the error stops the caller (Option A)."""
+    self.mock_key_manager.get_current_public_key.return_value = b"ecdsa_pub"
+    self.mock_key_manager.get_current_pqc_public_key.return_value = b"pqc_pub"
+    mock_get_cs_token_bytes.side_effect = RuntimeError("attestation failed")
+    token_manager = token.TokenManager(
+        key_manager=self.mock_key_manager,
+        attestation_token_path=self.attestation_token_path,
+        rng=self.seeded_rng,
+    )
+
+    with mock.patch.object(
+        token_manager, "_thread", autospec=True
+    ) as mock_thread:
+      with self.assertRaisesRegex(RuntimeError, "attestation failed"):
+        with token_manager:
+          self.fail("The with block must not run without a token.")
+
+      mock_thread.start.assert_not_called()
+
+  @mock.patch.dict(os.environ, {}, clear=True)
+  @mock.patch.object(token, "get_cs_token_bytes", autospec=True)
+  def test_context_manager_fails_on_empty_first_token(
+      self, mock_get_cs_token_bytes
+  ):
+    self.mock_key_manager.get_current_public_key.return_value = b"ecdsa_pub"
+    self.mock_key_manager.get_current_pqc_public_key.return_value = b"pqc_pub"
+    mock_get_cs_token_bytes.return_value = b""
+    token_manager = token.TokenManager(
+        key_manager=self.mock_key_manager,
+        attestation_token_path=self.attestation_token_path,
+        rng=self.seeded_rng,
+    )
+
+    with mock.patch.object(
+        token_manager, "_thread", autospec=True
+    ) as mock_thread:
+      with self.assertRaisesRegex(
+          RuntimeError, "Attestation service returned an empty token."
+      ):
+        with token_manager:
+          self.fail("The with block must not run without a token.")
+
+      mock_thread.start.assert_not_called()
+      self.assertFalse(self.attestation_token_path.exists())
+
 
 if __name__ == "__main__":
   absltest.main()

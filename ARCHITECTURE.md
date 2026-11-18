@@ -136,7 +136,7 @@ By verifying this entire chain (Hardware $$\rightarrow$$ Token $$\rightarrow$$ I
 *   **`AttestedPoolManager` & Lazy Revalidation**: To maintain performance, the pool manager hooks into `urllib3`. Attestation is an expensive operation, so connections are reused. By default, connections are reused for up to 55 minutes, after which a new attestation handshake is transparently forced over the existing socket to ensure continuous TEE integrity and key freshness.
 ### Server Side
 *   **`KeyManager`**: Manages the ephemeral cryptographic keys used in attestation token generation. It generates fresh signing keys, rotates them on a schedule, and maintains a brief overlap window during rotation.
-*   **`TokenManager`**: Runs in a background thread to proactively rotate the attestation tokens presented to clients, preventing latency spikes at rotation boundaries.
+*   **`TokenManager`**: Fetches the first attestation token synchronously when entered (server startup fails if the attestation service is unavailable or returns no token), then rotates tokens in a background thread to prevent latency spikes at rotation boundaries.
 *   **`AttestedTLS` & EKM Extraction**: Handles the post-handshake attestation exchange. Standard ASGI/WSGI servers abstract away the TLS socket. The middleware intercepts the ASGI scope and utilizes a custom C-extension (`ekm/_ekm.c`) to safely call OpenSSL's `SSL_export_keying_material` API.
 
 ---
