@@ -188,7 +188,7 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
       response: attestation_pb2.AttestConnectionResponse,
       tls_ekm: bytes,
   ) -> None:
-    """Validates a server proof.
+    """Validates a server proof and releases validator-owned resources.
 
     Args:
       response: The server's attestation proof.
@@ -199,7 +199,10 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
       exceptions.PolicyViolationError: If the server fails the policy check.
     """
     server_validator = self._attestation_validator_cls(self._policy)
-    server_validator.validate(response, tls_ekm)
+    try:
+      server_validator.validate(response, tls_ekm)
+    finally:
+      server_validator.close()
 
   def connect(self) -> None:
     """Establishes the TLS connection and performs attestation."""

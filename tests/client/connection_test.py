@@ -260,9 +260,10 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
         context=fixed_random_bytes,
     )
 
-    # Verify validate was called with a Proto object and the EKM
-    mock_validator_inst.validate.assert_called_once_with(
-        mock.ANY, b"fake_ekm"
+    # Verify validate was called with a Proto object and the EKM, then closed
+    self.assertEqual(
+        mock_validator_inst.mock_calls,
+        [mock.call.validate(mock.ANY, b"fake_ekm"), mock.call.close()],
     )
 
     # Verify timestamp updated
@@ -401,6 +402,38 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
 
     mock_super_close.assert_called_once_with(self.conn)
     self.assertFalse(self.conn.is_attested)
+
+  @mock.patch.object(HTTPSConnection, "request", autospec=True)
+  def test_handshake_closes_the_validator_after_failure(
+      self, mock_super_request
+  ):
+    del mock_super_request
+    mock_response = mock.create_autospec(urllib3.HTTPResponse, instance=True)
+    mock_response.status = 200
+    mock_response.headers = {"Content-Type": "application/x-protobuf"}
+    mock_response.data = (
+        attestation_pb2.AttestConnectionResponse().SerializeToString()
+    )
+    self.conn.getresponse = mock.MagicMock(return_value=mock_response)
+    self.conn._ekm_exporter_fn = mock.create_autospec(
+        ekm_exporter.export_keying_material, return_value=b"fake_ekm"
+    )
+    mock_validator_cls = mock.create_autospec(validator.AttestationValidator)
+    self.conn._attestation_validator_cls = mock_validator_cls
+    mock_validator_inst = mock_validator_cls.return_value
+    mock_validator_inst.validate.side_effect = (
+        exceptions.AttestationVerificationError("bad server proof")
+    )
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError, "bad server proof"
+    ):
+      self.conn._perform_attestation_handshake()
+
+    self.assertEqual(
+        mock_validator_inst.mock_calls,
+        [mock.call.validate(mock.ANY, b"fake_ekm"), mock.call.close()],
+    )
 
 
 class AttestedHTTPSConnectionPoolTest(absltest.TestCase):
