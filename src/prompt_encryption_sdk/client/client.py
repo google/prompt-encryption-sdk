@@ -15,6 +15,7 @@
 """Client for making attested prompt encryption requests."""
 
 import dataclasses
+import os
 from typing import Any
 
 from prompt_encryption_sdk.proto import attestation_pb2
@@ -24,6 +25,7 @@ import requests.adapters
 
 from . import connection
 from . import constants
+from . import core_adapter
 
 
 class AttestedHTTPSAdapter(requests.adapters.HTTPAdapter):
@@ -93,9 +95,21 @@ class PromptEncryptionClient:
   def session(self) -> requests.Session:
     """Creates a new requests.Session with the Attested Adapter mounted."""
     session = requests.Session()
-    adapter = AttestedHTTPSAdapter(
-        policy=self.policy, revalidation_timeout=self.revalidation_timeout
-    )
+    core_binary = core_adapter.configured_core_binary()
+    if core_binary:
+      if not os.path.isfile(core_binary) or not os.access(core_binary, os.X_OK):
+        raise ValueError(
+            "PROMPT_ENCRYPTION_CLIENT_CORE must name an executable file"
+        )
+      adapter = core_adapter.CoreHTTPSAdapter(
+          policy=self.policy,
+          executable=core_binary,
+          revalidation_timeout=self.revalidation_timeout,
+      )
+    else:
+      adapter = AttestedHTTPSAdapter(
+          policy=self.policy, revalidation_timeout=self.revalidation_timeout
+      )
     session.mount("https://", adapter)
     return session
 
