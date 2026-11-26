@@ -19,7 +19,7 @@ Client (TEE)                                        Server (TEE)
 |<============================================================>|
 |                                                              |
 +--[2] Refuse unless the session is TLS 1.3                    |
-+--    EKM = export_keying_material("EXPORTER-Prompt-Encryption-SDK", 32)
++--    EKM = export_keying_material("EXPORTER-Channel-Binding", 32)
 +--[3] Proof_client = Sign(K_client, {SHA256(EKM), SHA256(T_client),
 |                                     role=CLIENT, mode=MUTUAL, version=1})
 |                                                              |
@@ -53,8 +53,9 @@ mutual response echoes `mode` and `protocol_version` and sets
 
 ## Why there are no nonces
 
-Both peers bind to the TLS **Exported Keying Material** (RFC 5705), exported
-with the protocol label and *no context*. In TLS 1.3 (RFC 8446, section 7.5),
+Both peers bind to the TLS **Exported Keying Material** (RFC 5705) using the
+RFC 9266 `tls-exporter` channel binding label (`"EXPORTER-Channel-Binding"`) and
+*no context*. In TLS 1.3 (RFC 8446, section 7.5),
 no context and an empty context (`b""`) give the same keying material, so a peer
 in another language may use either. In TLS 1.2 they differ.
 
@@ -103,6 +104,12 @@ Because both peers now sign over the *same* value, three fields inside
 All three are absent from the wire for server-only proofs, so the existing
 signed payload is byte-for-byte unchanged.
 
+Because `"EXPORTER-Channel-Binding"` is a shared RFC 9266 label, any other
+`tls-exporter` protocol sharing the same TLS session derives the same bytes.
+Cross-protocol separation therefore depends on signing `SessionSignaturePayload`
+with dedicated keys: `KeyManager` keys must sign only SDK attestation payloads
+and must not be reused to sign other application data.
+
 ---
 
 ## No revalidation: a session is attested exactly once
@@ -126,8 +133,14 @@ To re-attest — after a key rotation, or when the attestation token nears
 expiry — **open a new connection**. The new TLS session brings a new EKM and
 therefore a genuinely fresh challenge.
 
-A *failed* exchange does not consume the session: a client that is rejected on
-policy may retry on the same connection.
+A *failed* exchange does not consume the session: on a failed client check, the
+server returns `403` without `Connection: close` and leaves the session
+unmarked, so a rejected client may retry on the same connection. Retrying on
+the same connection deviates from RFC 9266 section 4.1, which forbids reusing
+the channel binding across more than one authentication instance on a given TLS
+connection. This deviation is safe here because the server verifies the client
+before signing and emits no server proof on failure, so a failed attempt
+exposes no server signature over the channel binding.
 
 ---
 

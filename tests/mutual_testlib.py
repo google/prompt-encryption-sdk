@@ -285,7 +285,7 @@ class FakeTlsSession:
   def ekm(self) -> bytes:
     """Returns the keying material that both peers bind in mutual mode."""
     return self.export_keying_material(
-        attestation.EKM_LABEL, attestation.EKM_LENGTH
+        attestation.MUTUAL_EKM_LABEL, attestation.EKM_LENGTH
     )
 
 

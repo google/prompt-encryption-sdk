@@ -91,8 +91,18 @@ Client (urllib3/Pool)                           Server (TEE Workload)
 #### Step 1: Standard TLS Handshake
 A standard TLS 1.3 handshake establishes an encrypted channel and a shared session secret derived from ephemeral key exchange (ECDHE). The server presents a standard PKI certificate.
 #### Step 2: TLS Exported Keying Material (EKM)
-Both sides independently derive a session-specific value using RFC 5705 TLS Exported Keying Material.
-The label `"EXPORTER-Prompt-Encryption-SDK"` scopes this export specifically to this protocol, preventing cross-protocol attacks. The EKM is deterministically derived from the session's master secret; it cannot be forged without access to the session keys and uniquely identifies this specific TLS session.
+Both sides independently derive a session-specific value using RFC 5705 TLS
+Exported Keying Material. Server-only mode (v0) uses the label
+`"EXPORTER-Prompt-Encryption-SDK"` with the client nonce as context, while
+mutual attestation (v1) uses the RFC 9266 `tls-exporter` label
+`"EXPORTER-Channel-Binding"` with no context. The EKM is deterministically
+derived from the session's TLS exporter secret; it cannot be forged without
+access to the session keys and uniquely identifies this specific TLS session.
+Because the RFC 9266 label is shared with any other `tls-exporter` user on the
+same TLS session, cross-protocol separation in mutual mode relies on signing a
+serialized `SessionSignaturePayload` with dedicated attestation keys.
+Integrators must not reuse `KeyManager` signing keys to sign anything other than
+SDK attestation payloads.
 #### Step 3: TEE Attestation Report Generation & Session Binding
 The server maintains an ephemeral ECDSA P-256 key pair ($$K_{instance}$$), generated purely in TEE memory. The server interacts with the TEE hardware to obtain an Attestation Token ($$T_{attest}$$). This report contains:
 

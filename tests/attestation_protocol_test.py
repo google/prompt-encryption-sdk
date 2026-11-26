@@ -65,6 +65,9 @@ class BuildSignaturePayloadTest(parameterized.TestCase):
     self.assertEqual(
         attestation_protocol.EKM_LABEL, b"EXPORTER-Prompt-Encryption-SDK"
     )
+    self.assertEqual(
+        attestation_protocol.MUTUAL_EKM_LABEL, b"EXPORTER-Channel-Binding"
+    )
     self.assertEqual(attestation_protocol.EKM_LENGTH, 32)
 
   def test_server_only_payload_is_wire_compatible(self):

@@ -128,12 +128,26 @@ class MutualAttestationTlsTestBase(absltest.TestCase):
     self.assertEqual(response.data, tls_testlib.APP_BODY)
 
   def test_one_round_trip_attests_both_peers_and_authorizes_traffic(self):
-    conn = self._connection()
+    ekm = tls_testlib.RecordingEkmExporter()
+    conn = self._connection(ekm_exporter_fn=ekm)
 
     conn.connect()
 
     with self.subTest("BothPeersAttested"):
       self.assertTrue(conn.is_attested)
+    with self.subTest("ClientEkmMatchesRfc9266TlsExporter"):
+      self.assertIsInstance(conn.sock, ssl.SSLSocket)
+      self.assertLen(ekm.calls, 1)
+      self.assertIsNone(ekm.calls[0].context)
+      self.assertEqual(
+          ekm.calls[0].ekm,
+          exporter.export_keying_material(
+              conn.sock,
+              32,
+              b"EXPORTER-Channel-Binding",
+              context=b"",
+          ),
+      )
     with self.subTest("ExactlyOneAttestationExchange"):
       self.assertEqual(
           [exchange.status for exchange in self.server.recorder.attestations()],
@@ -395,7 +409,7 @@ class MutualAttestationTlsTestBase(absltest.TestCase):
     tls_ekm = exporter.export_keying_material(
         conn.sock,
         attestation_protocol.EKM_LENGTH,
-        attestation_protocol.EKM_LABEL,
+        attestation_protocol.MUTUAL_EKM_LABEL,
     )
 
     conn.request(

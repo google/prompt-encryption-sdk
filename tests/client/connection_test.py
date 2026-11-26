@@ -730,7 +730,7 @@ class MutualAttestedHTTPSConnectionTest(parameterized.TestCase):
 
     with self.subTest("EkmExportedWithoutContext"):
       self.export_ekm.assert_called_once_with(
-          self.conn.sock, constants.EKM_LENGTH, constants.EKM_LABEL
+          self.conn.sock, constants.EKM_LENGTH, constants.MUTUAL_EKM_LABEL
       )
     with self.subTest("ClientProvesItselfAsTheClientRole"):
       self.prover.create_proof.assert_called_once_with(

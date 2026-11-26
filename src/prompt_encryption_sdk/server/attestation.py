@@ -35,11 +35,18 @@ _REPLAY_MESSAGE = (
 )
 
 
-def _export_ekm(ssl_obj: Any, *, context: bytes | None) -> bytes:
+def _export_ekm(
+    ssl_obj: Any,
+    *,
+    label: bytes,
+    context: bytes | None,
+) -> bytes:
   """Extracts EKM using the standard library, falling back to the C extension.
 
   Args:
     ssl_obj: The SSL object from the TLS connection.
+    label: RFC 5705 exporter label (`EKM_LABEL` for server-only v0,
+      `MUTUAL_EKM_LABEL` for mutual v1).
     context: RFC 5705 context, or None for no context at all. Both peers must
       use the same one, because under TLS 1.2 an empty context and no context
       derive different keying material. Under TLS 1.3 they derive the same
@@ -60,7 +67,7 @@ def _export_ekm(ssl_obj: Any, *, context: bytes | None) -> bytes:
   if hasattr(ssl_obj, "export_keying_material"):
     try:
       ekm_bytes = ssl_obj.export_keying_material(
-          attestation_protocol.EKM_LABEL,
+          label,
           attestation_protocol.EKM_LENGTH,
           context=context,
       )
@@ -75,7 +82,7 @@ def _export_ekm(ssl_obj: Any, *, context: bytes | None) -> bytes:
     ekm_bytes = exporter.export_keying_material(
         sock=target_obj,
         length=attestation_protocol.EKM_LENGTH,
-        label=attestation_protocol.EKM_LABEL,
+        label=label,
         context=context,
     )
 
@@ -302,7 +309,11 @@ class AttestedTLS:
     # No expiry is recorded: the server verified no client evidence here, so it
     # holds nothing that can go stale. The client enforces its own revalidation
     # interval in this mode.
-    tls_ekm = _export_ekm(ssl_obj, context=request.nonce)
+    tls_ekm = _export_ekm(
+        ssl_obj,
+        label=attestation_protocol.EKM_LABEL,
+        context=request.nonce,
+    )
     proof = self._prover.create_proof(tls_ekm)
     with self._lock:
       # A mutual exchange on this session can finish while this one runs. Its
@@ -353,7 +364,11 @@ class AttestedTLS:
           "Client attestation proof is missing."
       )
 
-    tls_ekm = _export_ekm(ssl_obj, context=None)
+    tls_ekm = _export_ekm(
+        ssl_obj,
+        label=attestation_protocol.MUTUAL_EKM_LABEL,
+        context=None,
+    )
     claims = self._client_verifier().validate_proof(
         request.client_attestation,
         tls_ekm,

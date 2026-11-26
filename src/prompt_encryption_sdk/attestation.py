@@ -37,8 +37,12 @@ from prompt_encryption_sdk.proto import attestation_pb2
 # Wire version of the mutual exchange. Version 0 is the server-only flow.
 MUTUAL_ATTESTATION_PROTOCOL_VERSION: int = 1
 
-# TLS Exported Keying Material (RFC 5705) parameters.
+# TLS Exported Keying Material (RFC 5705 / RFC 9266) parameters.
+# Server-only (v0) keeps the original label with the client nonce as context.
+# Mutual (v1) uses the RFC 9266 `tls-exporter` channel binding label with no
+# context.
 EKM_LABEL: bytes = b"EXPORTER-Prompt-Encryption-SDK"
+MUTUAL_EKM_LABEL: bytes = b"EXPORTER-Channel-Binding"
 EKM_LENGTH: int = 32
 
 # The only TLS version, as `ssl.SSLSocket.version()` reports it, over which

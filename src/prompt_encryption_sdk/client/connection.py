@@ -321,7 +321,7 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
     tls_ekm = self._ekm_exporter_fn(
         self.sock,  # pyrefly: ignore[bad-argument-type]
         constants.EKM_LENGTH,
-        constants.EKM_LABEL,
+        constants.MUTUAL_EKM_LABEL,
     )
 
     # B. Prove our own identity before asking the server for its proof.

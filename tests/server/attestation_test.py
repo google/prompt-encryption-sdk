@@ -124,7 +124,12 @@ class AttestedTlsImplTest(absltest.TestCase):
         " ssl_obj.export_keying_material failed.",
     ):
       attested_tls_instance.attest_connection(request, ssl_obj=mock_ssl_obj)
-    mock_export_keying_material.assert_called_once()
+    mock_export_keying_material.assert_called_once_with(
+        sock=mock_ssl_obj._sslobj,
+        length=attestation_protocol.EKM_LENGTH,
+        label=attestation_protocol.EKM_LABEL,
+        context=b"",
+    )
 
   def test_attest_connection_no_verifier(self):
     mock_token_manager = mock.create_autospec(token.TokenManager, instance=True)
@@ -296,7 +301,7 @@ class MutualAttestedTlsTest(parameterized.TestCase):
     with self.subTest("EkmExportedWithoutContext"):
       # Both peers must derive the same value straight from the TLS session.
       self.ssl_obj.export_keying_material.assert_called_once_with(
-          b"EXPORTER-Prompt-Encryption-SDK", 32, context=None
+          b"EXPORTER-Channel-Binding", 32, context=None
       )
     with self.subTest("ServerProofBoundToTheSameEkmAsTheServerRole"):
       self.assertEqual(
@@ -316,6 +321,23 @@ class MutualAttestedTlsTest(parameterized.TestCase):
       self.assertEqual(response.pqc_session_signature, b"server-pqc-sig")
     with self.subTest("SessionInheritsTheClientTokenExpiry"):
       self.assertEqual(result.expires_at, self.client_token_exp)
+
+  @mock.patch.object(exporter, "export_keying_material", autospec=True)
+  def test_mutual_fallback_exporter_uses_rfc9266_label(
+      self, mock_export_keying_material
+  ):
+    self.ssl_obj.export_keying_material.side_effect = RuntimeError("no stdlib")
+    mock_export_keying_material.return_value = self.ekm
+    attested_tls = self._attested_tls()
+
+    attested_tls.attest_connection(_mutual_request(), ssl_obj=self.ssl_obj)
+
+    mock_export_keying_material.assert_called_once_with(
+        sock=self.ssl_obj,
+        length=attestation_protocol.EKM_LENGTH,
+        label=attestation_protocol.MUTUAL_EKM_LABEL,
+        context=None,
+    )
 
   def test_client_proof_is_verified_before_the_server_proves_itself(self):
     """A failed client check must not leak a fresh server proof."""
@@ -643,6 +665,11 @@ class MutualAttestedTlsTest(parameterized.TestCase):
     )
     # The server holds no client evidence in this mode, so nothing expires.
     self.assertEqual(result.expires_at, math.inf)
+    self.ssl_obj.export_keying_material.assert_called_once_with(
+        attestation_protocol.EKM_LABEL,
+        attestation_protocol.EKM_LENGTH,
+        context=b"n" * 32,
+    )
     self.client_validator.validate_proof.assert_not_called()
 
   def test_server_only_request_may_not_carry_a_client_proof(self):

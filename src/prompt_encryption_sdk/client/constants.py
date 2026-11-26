@@ -35,6 +35,7 @@ CS_DEFAULT_ISSUER: str = "https://confidentialcomputing.googleapis.com"
 
 # TLS Exported Keying Material Parameters
 EKM_LABEL: bytes = attestation_protocol.EKM_LABEL
+MUTUAL_EKM_LABEL: bytes = attestation_protocol.MUTUAL_EKM_LABEL
 EKM_LENGTH: int = attestation_protocol.EKM_LENGTH
 
 # Default revalidation interval in seconds (55 minutes).
