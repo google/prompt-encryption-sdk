@@ -31,7 +31,7 @@ import hashlib
 import pathlib
 import secrets
 import time
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 from prompt_encryption_sdk import attestation
 from prompt_encryption_sdk.client import constants
@@ -173,8 +173,7 @@ class FakeGca:
     Returns:
       An `AttestationValidator` with this fake as its OIDC validator.
     """
-    oidc_validator = cast(validator.OIDCTokenValidator, self)
-    return validator.AttestationValidator(policy, oidc_validator=oidc_validator)
+    return validator.AttestationValidator(policy, oidc_validator=self)
 
 
 def make_token_manager(

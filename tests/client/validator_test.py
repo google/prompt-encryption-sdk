@@ -52,6 +52,8 @@ _FAKE_CHALLENGE_NONCE = b"0123456789abcdef0123456789abcdef"
 _FAKE_KEY_ID_1 = "key_fingerprint_1"
 _FAKE_KEY_ID_2 = "key_fingerprint_2"
 _FAKE_KEY_ID_3 = "key_fingerprint_3"
+_ISSUED_AT = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+_TOKEN_LIFETIME = datetime.timedelta(hours=1)
 
 
 def _get_valid_claims(nonce: bytes | None = None) -> dict[str, Any]:
@@ -1547,6 +1549,7 @@ class OIDCTokenValidatorTest(parameterized.TestCase):
         expected_issuer="http://test-issuer",
         expected_audience=constants.DEFAULT_AUDIENCE,
         expected_type_header="JWT",
+        fixed_now=None,
     )
     mock_verifier.verify_and_decode.assert_called_once_with(
         token, mock_tink_validator
@@ -1586,6 +1589,50 @@ class OIDCTokenValidatorTest(parameterized.TestCase):
         exceptions.AttestationVerificationError, "OIDC Token validation failed"
     ):
       v.validate_token("some.invalid.token")
+
+  def test_validate_token_jwks_fetch_failure(self):
+    """Tests that JWKS fetch errors raise AttestationVerificationError."""
+    mock_jwk_client = self.enter_context(
+        mock.patch.object(jwt, "PyJWKClient", autospec=True)
+    )
+    mock_jwk_client.return_value.fetch_data.side_effect = (
+        requests.RequestException("network error")
+    )
+
+    v = validator.OIDCTokenValidator()
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError, "Failed to fetch OIDC JWK set"
+    ):
+      v.validate_token("some.token")
+
+  def test_validate_token_missing_issuer_raises(self):
+    """Tests that an unconfigured issuer raises before fetching JWKS."""
+    mock_jwk_client = self.enter_context(
+        mock.patch.object(jwt, "PyJWKClient", autospec=True)
+    )
+    v = validator.OIDCTokenValidator()
+    v._issuer = ""
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError,
+        "OIDC issuer is not configured",
+    ):
+      v.validate_token("some.token")
+    mock_jwk_client.return_value.fetch_data.assert_not_called()
+
+  def test_validate_token_empty_audience_raises_before_fetch(self):
+    """Tests that an empty expected_audience raises ValueError before fetching JWKS."""
+    mock_jwk_client = self.enter_context(
+        mock.patch.object(jwt, "PyJWKClient", autospec=True)
+    )
+    v = validator.OIDCTokenValidator()
+
+    with self.assertRaisesRegex(
+        ValueError, "expected_audience must be a non-empty string"
+    ):
+      v.validate_token("some.token", expected_audience="")
+    mock_jwk_client.return_value.fetch_data.assert_not_called()
 
   def test_oidc_token_validator_close_closes_session(self):
     mock_session = mock.create_autospec(requests.Session)
@@ -1666,6 +1713,175 @@ class OIDCTokenValidatorTest(parameterized.TestCase):
           "OIDC Token validation failed",
       ):
         oidc_validator.validate_token(signed_token, **validate_kwargs)
+
+
+def _new_jwt_signing_key() -> tink.KeysetHandle:
+  return tink.new_keyset_handle(tink_jwt.jwt_es256_template())
+
+
+def _jwk_set_json(private_handle: tink.KeysetHandle) -> str:
+  return tink_jwt.jwk_set_from_public_keyset_handle(
+      private_handle.public_keyset_handle()
+  )
+
+
+def _sign_token(
+    private_handle: tink.KeysetHandle,
+    *,
+    issuer: str = constants.CS_DEFAULT_ISSUER,
+    audience: str = constants.DEFAULT_AUDIENCE,
+    type_header: str = "JWT",
+) -> str:
+  signer = private_handle.primitive(tink_jwt.JwtPublicKeySign)
+  return signer.sign_and_encode(
+      tink_jwt.new_raw_jwt(
+          type_header=type_header,
+          issuer=issuer,
+          audiences=[audience],
+          issued_at=_ISSUED_AT,
+          not_before=_ISSUED_AT,
+          expiration=_ISSUED_AT + _TOKEN_LIFETIME,
+          custom_claims={"claim": "value"},
+      )
+  )
+
+
+class VerifyOidcJwtTest(parameterized.TestCase):
+
+  def test_accepts_token_at_fixed_time_within_validity(self):
+    private_handle = _new_jwt_signing_key()
+
+    claims = validator.verify_oidc_jwt(
+        _sign_token(private_handle),
+        _jwk_set_json(private_handle),
+        expected_issuer=constants.CS_DEFAULT_ISSUER,
+        expected_audience=constants.DEFAULT_AUDIENCE,
+        fixed_now=_ISSUED_AT + datetime.timedelta(minutes=30),
+    )
+
+    self.assertEqual(claims["claim"], "value")
+    self.assertEqual(claims["iss"], constants.CS_DEFAULT_ISSUER)
+    self.assertEqual(claims["aud"], [constants.DEFAULT_AUDIENCE])
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="current_time_after_expiry",
+          fixed_now=None,
+      ),
+      dict(
+          testcase_name="at_expiry",
+          fixed_now=_ISSUED_AT + _TOKEN_LIFETIME,
+      ),
+      dict(
+          testcase_name="before_not_before",
+          fixed_now=_ISSUED_AT - datetime.timedelta(seconds=1),
+      ),
+  )
+  def test_rejects_token_outside_validity(self, fixed_now):
+    private_handle = _new_jwt_signing_key()
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError, "OIDC Token validation failed"
+    ):
+      validator.verify_oidc_jwt(
+          _sign_token(private_handle),
+          _jwk_set_json(private_handle),
+          expected_issuer=constants.CS_DEFAULT_ISSUER,
+          expected_audience=constants.DEFAULT_AUDIENCE,
+          fixed_now=fixed_now,
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="other_signing_key",
+          sign_kwargs={},
+          jwks_from_other_key=True,
+      ),
+      dict(
+          testcase_name="other_issuer",
+          sign_kwargs={"issuer": "https://other-issuer.example"},
+          jwks_from_other_key=False,
+      ),
+      dict(
+          testcase_name="other_audience",
+          sign_kwargs={"audience": "other-audience"},
+          jwks_from_other_key=False,
+      ),
+      dict(
+          testcase_name="wrong_type_header",
+          sign_kwargs={"type_header": "at+jwt"},
+          jwks_from_other_key=False,
+      ),
+  )
+  def test_rejects_token_failing_signature_or_claims(
+      self, sign_kwargs, jwks_from_other_key
+  ):
+    private_handle = _new_jwt_signing_key()
+    jwks_handle = (
+        _new_jwt_signing_key() if jwks_from_other_key else private_handle
+    )
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError, "OIDC Token validation failed"
+    ):
+      validator.verify_oidc_jwt(
+          _sign_token(private_handle, **sign_kwargs),
+          _jwk_set_json(jwks_handle),
+          expected_issuer=constants.CS_DEFAULT_ISSUER,
+          expected_audience=constants.DEFAULT_AUDIENCE,
+          fixed_now=_ISSUED_AT + datetime.timedelta(minutes=30),
+      )
+
+  def test_rejects_invalid_jwk_set(self):
+    private_handle = _new_jwt_signing_key()
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError, "OIDC Token validation failed"
+    ):
+      validator.verify_oidc_jwt(
+          _sign_token(private_handle),
+          "not a JWK set",
+          expected_issuer=constants.CS_DEFAULT_ISSUER,
+          expected_audience=constants.DEFAULT_AUDIENCE,
+          fixed_now=_ISSUED_AT + datetime.timedelta(minutes=30),
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="empty_expected_issuer",
+          expected_issuer="",
+          expected_audience=constants.DEFAULT_AUDIENCE,
+          fixed_now=_ISSUED_AT + datetime.timedelta(minutes=30),
+          expected_error="expected_issuer must be a non-empty string",
+      ),
+      dict(
+          testcase_name="empty_expected_audience",
+          expected_issuer=constants.CS_DEFAULT_ISSUER,
+          expected_audience="",
+          fixed_now=_ISSUED_AT + datetime.timedelta(minutes=30),
+          expected_error="expected_audience must be a non-empty string",
+      ),
+      dict(
+          testcase_name="fixed_now_without_time_zone",
+          expected_issuer=constants.CS_DEFAULT_ISSUER,
+          expected_audience=constants.DEFAULT_AUDIENCE,
+          fixed_now=datetime.datetime(2026, 1, 1, 0, 30),
+          expected_error="tzinfo",
+      ),
+  )
+  def test_invalid_validator_arguments_raise_value_error(
+      self, expected_issuer, expected_audience, fixed_now, expected_error
+  ):
+    private_handle = _new_jwt_signing_key()
+
+    with self.assertRaisesRegex(ValueError, expected_error):
+      validator.verify_oidc_jwt(
+          _sign_token(private_handle),
+          _jwk_set_json(private_handle),
+          expected_issuer=expected_issuer,
+          expected_audience=expected_audience,
+          fixed_now=fixed_now,
+      )
 
 
 if __name__ == "__main__":

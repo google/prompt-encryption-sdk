@@ -15,13 +15,14 @@
 """Provides classes for validating OIDC tokens and attestation evidence."""
 
 from collections.abc import Mapping
+import datetime
 import hashlib
 import json
 import logging
 import math
 import ssl
 import types
-from typing import Any
+from typing import Any, Protocol
 
 from prompt_encryption_sdk import attestation as attestation_protocol
 from prompt_encryption_sdk.client import constants
@@ -215,6 +216,88 @@ def _validate_confidential_space_policy(
         )
 
 
+def verify_oidc_jwt(
+    token: str,
+    jwk_set_json: str,
+    *,
+    expected_issuer: str,
+    expected_audience: str,
+    fixed_now: datetime.datetime | None = None,
+) -> dict[str, Any]:
+  """Verifies an OIDC JWT against a JWK set and returns its claims.
+
+  This function makes no network calls, so it gives the same result for the
+  same token, keys, and time.
+
+  Args:
+    token: The raw JWT string.
+    jwk_set_json: The JWK set, as JSON, that holds the token's signing key.
+    expected_issuer: The non-empty expected issuer (`iss` claim) of the token.
+    expected_audience: The non-empty expected audience (`aud` claim) of the
+      token.
+    fixed_now: The time at which to check the `exp` and `nbf` claims. It must
+      have a time zone. If None, the current time is used. Intended for offline
+      replay and tests; production callers should leave this as None or use
+      `OIDCTokenValidator`.
+
+  Returns:
+    The decoded claims dictionary.
+
+  Raises:
+    ValueError: If `expected_issuer` or `expected_audience` is empty, or if
+      `fixed_now` has no time zone.
+    exceptions.AttestationVerificationError: If the JWK set is invalid, or the
+      token fails signature or claim validation.
+  """
+  if not expected_issuer:
+    raise ValueError("expected_issuer must be a non-empty string.")
+  if not expected_audience:
+    raise ValueError("expected_audience must be a non-empty string.")
+  jwt_validator = tink_jwt.new_validator(
+      expected_issuer=expected_issuer,
+      expected_audience=expected_audience,
+      expected_type_header="JWT",
+      fixed_now=fixed_now,
+  )
+  try:
+    public_keyset_handle = tink_jwt.jwk_set_to_public_keyset_handle(
+        jwk_set_json
+    )
+    verifier = public_keyset_handle.primitive(tink_jwt.JwtPublicKeyVerify)
+    result = verifier.verify_and_decode(token, jwt_validator)
+    return result._raw_jwt._payload
+  except Exception as e:
+    raise exceptions.AttestationVerificationError(
+        "OIDC Token validation failed."
+    ) from e
+
+
+class OIDCValidator(Protocol):
+  """Interface for verifying OIDC tokens inside `AttestationValidator`."""
+
+  def validate_token(
+      self,
+      token: str,
+      /,
+      *,
+      expected_audience: str = constants.DEFAULT_AUDIENCE,
+  ) -> dict[str, Any]:
+    """Decodes and validates the OIDC token signature and standard claims.
+
+    Args:
+      token: The raw JWT string.
+      expected_audience: The expected audience (`aud` claim) of the token.
+
+    Returns:
+      The decoded claims dictionary.
+
+    Raises:
+      ValueError: If `expected_audience` is empty.
+      exceptions.AttestationVerificationError: If token validation fails.
+    """
+    ...
+
+
 class OIDCTokenValidator:
   """Validates OIDC tokens issued by Confidential Space using PyJWT."""
 
@@ -257,32 +340,36 @@ class OIDCTokenValidator:
     """Decodes and validates the OIDC token signature and standard claims.
 
     Args:
-        token: The raw JWT string.
-        expected_audience: The expected audience (`aud` claim) of the token.
+      token: The raw JWT string.
+      expected_audience: The expected audience (`aud` claim) of the token.
 
     Returns:
-        The decoded claims dictionary.
+      The decoded claims dictionary.
+
+    Raises:
+      ValueError: If `expected_audience` is empty.
+      exceptions.AttestationVerificationError: If the OIDC issuer is not
+        configured, fetching the JWK set fails, or token validation fails.
     """
-    try:
-      # 1. Fetch the signing key that matches the 'kid' in the token header
-      assert self._jwks_client is not None
-      jwk_set_dict = self._jwks_client.fetch_data()
-      jwk_set_json_str = json.dumps(jwk_set_dict)
-      public_keyset_handle = tink_jwt.jwk_set_to_public_keyset_handle(
-          jwk_set_json_str
-      )
-      verifier = public_keyset_handle.primitive(tink_jwt.JwtPublicKeyVerify)
-      validator = tink_jwt.new_validator(
-          expected_issuer=self._issuer,
-          expected_audience=expected_audience,
-          expected_type_header="JWT",
-      )
-      result = verifier.verify_and_decode(token, validator)
-      return result._raw_jwt._payload
-    except (tink.TinkError, Exception) as e:
+    assert self._jwks_client is not None
+    if not expected_audience:
+      raise ValueError("expected_audience must be a non-empty string.")
+    if not self._issuer:
       raise exceptions.AttestationVerificationError(
-          "OIDC Token validation failed."
+          "OIDC issuer is not configured."
+      )
+    try:
+      jwk_set_json = json.dumps(self._jwks_client.fetch_data())
+    except Exception as e:
+      raise exceptions.AttestationVerificationError(
+          "Failed to fetch OIDC JWK set."
       ) from e
+    return verify_oidc_jwt(
+        token,
+        jwk_set_json,
+        expected_issuer=self._issuer,
+        expected_audience=expected_audience,
+    )
 
 
 class AttestationValidator:
@@ -291,18 +378,32 @@ class AttestationValidator:
   def __init__(
       self,
       policy: attestation_pb2.AttestationPolicy,
-      oidc_validator: OIDCTokenValidator | None = None,
+      oidc_validator: OIDCValidator | None = None,
       pem_loader: Any = serialization.load_pem_public_key,
   ):
+    """Initializes the validator.
+
+    Args:
+      policy: The attestation policy that the peer must satisfy.
+      oidc_validator: Optional OIDC token validator. When omitted, a new
+        `OIDCTokenValidator` is created and owned by this instance; a
+        caller-supplied validator is not closed by `close()`.
+      pem_loader: Callable used to parse PEM-encoded ECDSA public keys.
+    """
     self._policy = policy
-    self._oidc_validator = oidc_validator or OIDCTokenValidator()
-    self._owns_oidc_validator = oidc_validator is None
+    if oidc_validator is None:
+      owned_validator = OIDCTokenValidator()
+      self._oidc_validator: OIDCValidator = owned_validator
+      self._owned_oidc_validator: OIDCTokenValidator | None = owned_validator
+    else:
+      self._oidc_validator = oidc_validator
+      self._owned_oidc_validator = None
     self._pem_loader = pem_loader
 
   def close(self) -> None:
-    """Closes resources held by the validator."""
-    if self._owns_oidc_validator:
-      self._oidc_validator.close()
+    """Closes resources owned by the validator."""
+    if self._owned_oidc_validator is not None:
+      self._owned_oidc_validator.close()
 
   def _validate_oidc_token(self, attestation_token: str) -> dict[str, Any]:
     """Validates the OIDC token signature and expected audience claim."""

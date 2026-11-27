@@ -46,7 +46,7 @@ import sys
 import threading
 import time
 import types
-from typing import Any, cast
+from typing import Any
 import urllib.parse
 
 from prompt_encryption_sdk.client import constants
@@ -190,8 +190,7 @@ class FakeGca:
       self, policy: attestation_pb2.AttestationPolicy
   ) -> validator.AttestationValidator:
     """Use as `attestation_validator_cls` on the client connection classes."""
-    oidc_validator = cast(validator.OIDCTokenValidator, self)
-    return validator.AttestationValidator(policy, oidc_validator=oidc_validator)
+    return validator.AttestationValidator(policy, oidc_validator=self)
 
 
 def make_token_manager(
